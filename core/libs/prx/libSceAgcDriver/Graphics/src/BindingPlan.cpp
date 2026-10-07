@@ -87,7 +87,7 @@ BindingPlan::BindingPlan(const Context& context, std::span<const CompiledShader>
                     Require(words == 4, "guest sampler descriptor must contain 4 dwords");
                     stageSamplers += binding.count;
                     Require(stageSamplers <= context.limits.maxPerStageDescriptorSamplers, "shader sampler descriptors exceed per-stage limits");
-                    Require(binding.samplerDepthCompare.size() == binding.count, "guest sampler binding is missing depth comparison metadata");
+                    Require(binding.Usage().samplerDepthCompare.size() == binding.count, "guest sampler binding is missing depth comparison metadata");
                     Require(binding.samplerUnnormalized.empty() || binding.samplerUnnormalized.size() == binding.count, "guest sampler binding has unnormalized coordinate metadata of another size");
                     Require(static_cast<std::uint64_t>(samplers) + binding.count <= context.limits.maxDescriptorSetSamplers, "pipeline sampler descriptors exceed device limits");
                     item.layout.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
@@ -107,8 +107,8 @@ BindingPlan::BindingPlan(const Context& context, std::span<const CompiledShader>
                     Require(binding.guestDescriptor.size() == static_cast<std::uint64_t>(binding.count) * 4, "guest buffer descriptor must contain four DWORDs per array element");
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         Buffer buffer;
-                        buffer.written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                        buffer.atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
+                        buffer.written = element >= binding.Usage().bufferWritten.size() || binding.Usage().bufferWritten[element];
+                        buffer.atomic = element < binding.Usage().bufferAtomic.size() && binding.Usage().bufferAtomic[element];
                         const auto position = static_cast<std::uint64_t>(shader.program->memoryOffsetDword) * 4 + element;
                         Require(position <= std::numeric_limits<std::uint32_t>::max(), "guest buffer offset exceeds shader data address space");
                         if (!shader.program->pushConstants.empty()) {

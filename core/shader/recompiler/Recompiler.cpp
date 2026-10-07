@@ -304,7 +304,7 @@ std::uint64_t nextVariantId() {
     return variants.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization, std::exception_ptr* emissionFailure = nullptr) {
+CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSpecialization& resourceSpecialization, std::exception_ptr* emissionFailure = nullptr) {
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
@@ -320,7 +320,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     auto bindings = bindingAllocator.Allocate(program, request.layout);
 
     constexpr DescriptorBindingBuilder descriptorBindingBuilder;
-    descriptorBindingBuilder.Populate(bindings, program, resourceSnapshot, partialThreads(request));
+    descriptorBindingBuilder.Prepare(bindings, program.Info(), program.Resources().stage);
 
     SpirvTargetOptions targetOptions {};
     targetOptions.vulkanVersion = request.target.vulkanVersion;
@@ -371,18 +371,13 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     result.bindings.clear();
     result.pushConstants.clear();
     for (auto& attribute : result.vertexAttributes) attribute.resource = {};
-    bindings.bindings.clear();
     bindings.pushConstants.clear();
     return {resourceSpecialization, request.layout, std::move(program).TakeCompiledInfo(), std::move(bindings), std::move(result)};
 }
 
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot) {
     auto result = variant.result;
-    BindingAllocationResult bindings;
-    bindings.layout = variant.bindings.layout;
-    bindings.pushConstantOffsetBytes = variant.bindings.pushConstantOffsetBytes;
-    bindings.pushConstantSizeBytes = variant.bindings.pushConstantSizeBytes;
-    DescriptorBindingBuilder{}.Populate(bindings, variant.info.info, variant.info.stage, variant.info.userDataBase, snapshot, partialThreads(request));
+    auto bindings = DescriptorBindingBuilder{}.Materialize(variant.bindings, variant.info.info, variant.info.userDataBase, snapshot, partialThreads(request));
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
     for (auto& attribute : result.vertexAttributes) {
@@ -396,7 +391,7 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
-std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, bool& cacheHit) {
+std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, const ResourceSpecialization& specialization, bool& cacheHit) {
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
             cacheHit = true;
@@ -425,7 +420,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         source.program.reset();
         std::exception_ptr emissionFailure;
         try {
-            variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), snapshot, specialization, &emissionFailure));
+            variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), specialization, &emissionFailure));
         } catch (...) {
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, specialization, emissionFailure});
             throw;
@@ -443,7 +438,7 @@ RecompileResult materializeVariant(SourceEntry& source, const RecompileRequest& 
     bool cacheHit = false;
     {
         std::lock_guard lock(source.mutex);
-        variant = findOrCompileVariant(source, request, snapshot, specialization, cacheHit);
+        variant = findOrCompileVariant(source, request, specialization, cacheHit);
     }
     auto result = materializeResult(*variant, request, snapshot);
     result.cacheHit = cacheHit;
@@ -461,7 +456,7 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
         auto program = PrepareResourceProgram(request);
         const auto plan = materializer.ExtractPlan(program);
         materializer.Materialize(plan, runtime, snapshot, specialization);
-        const auto variant = compileVariant(request, std::move(program), snapshot, specialization);
+        const auto variant = compileVariant(request, std::move(program), specialization);
         return materializeResult(variant, request, snapshot);
     }
     const auto source = getSource(request);
@@ -561,7 +556,7 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
     auto& counters = resultMemoCounters();
     {
         std::lock_guard lock(source.mutex);
-        variant = findOrCompileVariant(source, request, snapshot, specialization, cacheHit);
+        variant = findOrCompileVariant(source, request, specialization, cacheHit);
         index = (variant->result.variantId * 0x9e3779b97f4a7c15ull) ^ hash;
         const auto found = source.memoIndex.find(index);
         if (found != source.memoIndex.end() && found->second->variantId == variant->result.variantId && found->second->hash == hash) {
@@ -610,7 +605,7 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
 std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (!request.useCache || capture.source == nullptr) {
         auto program = PrepareResourceProgram(request);
-        const auto variant = compileVariant(request, std::move(program), capture.snapshot, capture.specialization);
+        const auto variant = compileVariant(request, std::move(program), capture.specialization);
         return std::make_shared<const RecompileResult>(materializeResult(variant, request, capture.snapshot));
     }
     if (!ResultMemo()) return std::make_shared<const RecompileResult>(materializeVariant(*capture.source, request, capture.snapshot, capture.specialization));
