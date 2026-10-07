@@ -131,31 +131,35 @@ public:
         }
     }
 
-    std::shared_ptr<Texture> Sampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::span<DepthSurface* const> slices, bool stencil) {
-        std::array<std::uint32_t, 16> key{};
-        std::copy_n(words.begin(), std::min<std::size_t>(words.size(), 8), key.begin());
-        key[8] = components.r;
-        key[9] = components.g;
-        key[10] = components.b;
-        key[11] = components.a;
-        key[12] = resource.baseArray;
-        key[13] = resource.depthOrLastArray;
-        key[14] = static_cast<std::uint32_t>(resource.dimension);
-        key[15] = stencil;
-        auto found = textures.find(key);
-        if (found == textures.end()) {
+    std::shared_ptr<Texture> Sampled(const GuestTextureResource& resource, VkComponentMapping components, std::span<DepthSurface* const> slices, bool stencil) {
+        const VkImageAspectFlags aspect = stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+        const BackingKey backingKey{resource.baseAddress, resource.baseArray, slices.size(), static_cast<std::uint64_t>(resource.tileMode), aspect, resource.dccAddress, resource.dccAlphaOnMsb, resource.format};
+        auto backing = arrays.find(backingKey);
+        if (backing == arrays.end() && (slices.size() > 1 || slices.front() == nullptr)) {
             SampledDepth sampled;
-            if (slices.size() > 1 || slices.front() == nullptr) sampled.array = std::make_unique<DepthSurface>(context, target, static_cast<std::uint32_t>(slices.size()));
-            const auto source = sampled.array ? sampled.array->image : slices.front()->image;
-            const auto type = resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-            sampled.texture = std::make_shared<Texture>(context, source, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, type, static_cast<std::uint32_t>(slices.size()));
+            sampled.array = std::make_shared<DepthSurface>(context, target, static_cast<std::uint32_t>(slices.size()));
             sampled.versions.resize(slices.size());
             sampled.guest.resize(slices.size());
-            found = textures.emplace(key, std::move(sampled)).first;
+            backing = arrays.emplace(backingKey, std::move(sampled)).first;
         }
-        auto& sampled = found->second;
-        if (sampled.array) sampled.array->CopySlices(resource, slices, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, sampled.versions, sampled.guest);
-        return sampled.texture;
+        const auto key = std::pair{backingKey, std::array<std::uint32_t, 5>{components.r, components.g, components.b, components.a, static_cast<std::uint32_t>(resource.dimension)}};
+        auto found = textures.find(key);
+        if (found == textures.end()) {
+            const auto type = resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+            std::shared_ptr<Texture> texture;
+            if (backing == arrays.end()) {
+                texture = std::make_shared<Texture>(context, slices.front()->image, target.format, aspect, components, type, 1);
+            } else {
+                auto owned = std::make_shared<SampledView>(backing->second.array, aspect, components, type, static_cast<std::uint32_t>(slices.size()));
+                texture = std::shared_ptr<Texture>(owned, &owned->texture);
+            }
+            found = textures.emplace(key, std::move(texture)).first;
+        }
+        if (backing != arrays.end()) {
+            auto& sampled = backing->second;
+            sampled.array->CopySlices(resource, slices, aspect, sampled.versions, sampled.guest);
+        }
+        return found->second;
     }
 
     void CopySlices(const GuestTextureResource& resource, std::span<DepthSurface* const> slices, VkImageAspectFlags aspect, std::vector<std::pair<VkImage, std::uint64_t>>& versions, std::vector<GuestDepthSlice>& guest) {
@@ -258,16 +262,24 @@ public:
 private:
     std::uint64_t depthVersion = 1;
     std::uint64_t stencilVersion = 1;
+    using BackingKey = std::array<std::uint64_t, 8>;
     struct SampledDepth {
-        std::unique_ptr<DepthSurface> array;
-        std::shared_ptr<Texture> texture;
+        std::shared_ptr<DepthSurface> array;
         std::vector<std::pair<VkImage, std::uint64_t>> versions;
         std::vector<GuestDepthSlice> guest;
     };
-    std::map<std::array<std::uint32_t, 16>, SampledDepth> textures;
+    struct SampledView {
+        std::shared_ptr<DepthSurface> array;
+        Texture texture;
+        SampledView(std::shared_ptr<DepthSurface> source, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType type, std::uint32_t layers)
+            : array(std::move(source)), texture(array->context, array->image, array->target.format, aspect, components, type, layers) {}
+    };
+    std::map<BackingKey, SampledDepth> arrays;
+    std::map<std::pair<BackingKey, std::array<std::uint32_t, 5>>, std::shared_ptr<Texture>> textures;
 
     void release() noexcept {
         textures.clear();
+        arrays.clear();
         if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
@@ -403,7 +415,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         }
         slices.push_back(slice);
     }
-    return base->Sampled(words, resource, components, slices, stencil);
+    return base->Sampled(resource, components, slices, stencil);
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {

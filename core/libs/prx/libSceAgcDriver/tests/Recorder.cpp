@@ -165,6 +165,7 @@ public:
             function<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(context.physical, &context.memory);
             VkPhysicalDeviceProperties properties{};
             function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(context.physical, &properties);
+            std::cout << "Vulkan device: " << properties.deviceName << '\n';
             context.limits = properties.limits;
             context.bufferDeviceAddress = true;
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
@@ -2557,10 +2558,12 @@ void expectRed(float got, float want, const char* what) {
 void depthClearPassTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     DepthTarget target{0x10000, 0x20000, {64, 64}, VK_FORMAT_D32_SFLOAT_S8_UINT, 0.25f, 19};
+    SampleProgram program(context, recorder);
     struct Release {
         const Context& context;
-        ~Release() { ClearDepthSurfaces(context.device); }
-    } release{context};
+        Recorder& recorder;
+        ~Release() { recorder.Sync(); ClearDepthSurfaces(context.device); }
+    } release{context, recorder};
     RunDepthClearPass(context, {target, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT});
     GuestTextureResource resource{};
     resource.baseAddress = target.address;
@@ -2573,7 +2576,6 @@ void depthClearPassTests(const Device& device, Recorder& recorder) {
     const VkComponentMapping mapping{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     const auto texture = DepthSurfaceTexture(context, words, resource, mapping);
     Require(texture != nullptr, "depth clear did not create a sampleable surface");
-    SampleProgram program(context, recorder);
     expectRed(program.Red(texture->View(), texture->Layout(), 0.0f), 0.25f, "initial depth clear");
     target.clearDepth = 0.75f;
     RunDepthClearPass(context, {target, VK_IMAGE_ASPECT_DEPTH_BIT});
@@ -2665,11 +2667,13 @@ void clearDepthAttachment(const Context& context, Recorder& recorder, const Dept
         const Context& context;
         VkRenderPass& pass;
         VkFramebuffer& framebuffer;
+        Recorder& recorder;
         ~Release() {
+            recorder.Sync();
             if (framebuffer) context.Function<PFN_vkDestroyFramebuffer>("vkDestroyFramebuffer")(context.device, framebuffer, nullptr);
             if (pass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, pass, nullptr);
         }
-    } release{context, pass, framebuffer};
+    } release{context, pass, framebuffer, recorder};
     Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &info, nullptr, &pass), "depth test render pass");
     VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     framebufferInfo.renderPass = pass;
@@ -2694,20 +2698,21 @@ void clearDepthAttachment(const Context& context, Recorder& recorder, const Dept
     recorder.Sync();
 }
 
-void depthArrayTests(const Device& device, Recorder& recorder) {
+void depthArrayTests(const Device& device, Recorder& recorder, bool failBeforeSync = false) {
     auto context = device.GetContext();
     DepthOperations operations(context);
     TextureDetiler detiler(context);
     context.detiler = &detiler;
     TextureCache cache(context);
     context.textureCache = &cache;
-    struct Release {
-        const Context& context;
-        ~Release() { ClearDepthSurfaces(context.device); }
-    } release{context};
     SampleProgram arrayProgram(context, recorder, SAMPLE_Depth_ARRAY_SPV);
     SampleProgram stencilProgram(context, recorder, SAMPLE_Stencil_ARRAY_SPV, true);
     SampleProgram flatProgram(context, recorder);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        ~Release() { recorder.Sync(); ClearDepthSurfaces(context.device); }
+    } release{context, recorder};
     for (const auto format : {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
         const bool stencil = format == VK_FORMAT_D32_SFLOAT_S8_UINT;
         DepthTarget target{stencil ? 0x2000000u : 0x1000000u, stencil ? 0x3000000u : 0u, {129, 137}, format, 0.0f, 0};
@@ -2750,6 +2755,24 @@ void depthArrayTests(const Device& device, Recorder& recorder) {
         for (std::uint32_t layer = 0; layer < targets.size(); ++layer) expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, static_cast<float>(layer)), targets[layer].clearDepth, "depth array slice contents");
         expectRed(flatProgram.Red(texture->FirstLayerView(), texture->Layout(), 0), targets[0].clearDepth, "depth array first-layer view");
         Require(sample(resource) == texture, "an unchanged depth array was not reused");
+        const auto variantImages = operations.images;
+        const auto variantCopies = operations.copies;
+        auto oneMapping = swizzle;
+        oneMapping.r = VK_COMPONENT_SWIZZLE_ONE;
+        const auto oneTexture = DepthSurfaceTexture(context, descriptorWords(resource), resource, oneMapping);
+        expectRed(arrayProgram.Red(oneTexture->View(), oneTexture->Layout(), 0, 2), 1.0f, "depth array view ignored its component mapping");
+        auto alphaMapping = swizzle;
+        alphaMapping.a = VK_COMPONENT_SWIZZLE_R;
+        const auto alphaTexture = DepthSurfaceTexture(context, descriptorWords(resource), resource, alphaMapping);
+        if (failBeforeSync) {
+            auto extra = resource;
+            extra.baseArray = 1;
+            static_cast<void>(sample(extra));
+            throw std::runtime_error("intentional depth test failure with pending copies");
+        }
+        recorder.Sync();
+        Require(operations.images == variantImages, "a component mapping allocated another depth array");
+        Require(operations.copies == variantCopies, "a component mapping copied unchanged depth slices");
         const auto readOnlyCopies = operations.copies;
         static_cast<void>(DepthSurfaceView(context, targets[2]));
         State readOnly{};
@@ -2787,6 +2810,7 @@ void depthArrayTests(const Device& device, Recorder& recorder) {
         RunDepthClearPass(context, {targets[2], VK_IMAGE_ASPECT_DEPTH_BIT});
         Require(bindings.ProveCurrent(shader), "depth array bindings failed revalidation after a clear");
         expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.875f, "cached shader resources did not refresh a depth array");
+        expectRed(arrayProgram.Red(alphaTexture->View(), alphaTexture->Layout(), 0, 2), 0.875f, "component mappings do not share depth refreshes");
         Require(sample(resource) == texture, "updating a depth array replaced its sampled view");
         expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.875f, "depth array retained a cleared layer");
         expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, 1), targets[1].clearDepth, "depth array clear changed another layer");
@@ -2861,6 +2885,7 @@ void depthArrayTests(const Device& device, Recorder& recorder) {
 
 void depthArrayGuestTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
+    DepthOperations operations(context);
     TextureDetiler detiler(context);
     context.detiler = &detiler;
     SampleProgram depthProgram(context, recorder, SAMPLE_Depth_ARRAY_SPV);
@@ -2917,9 +2942,19 @@ void depthArrayGuestTests(const Device& device, Recorder& recorder) {
         expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 1), 0.5f, "mixed array did not detile guest layer one");
         expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.75f, "mixed array did not detile guest layer two");
         Require(sample(resource) == texture, "unchanged mixed array was replaced");
+        const auto variantImages = operations.images;
+        const auto variantCopies = operations.copies;
+        const auto variantUploads = operations.uploads;
+        auto alphaMapping = mapping;
+        alphaMapping.a = VK_COMPONENT_SWIZZLE_R;
+        const auto alphaTexture = DepthSurfaceTexture(context, words, resource, alphaMapping);
+        recorder.Sync();
+        Require(operations.images == variantImages, "a mixed array mapping allocated another image");
+        Require(operations.copies == variantCopies && operations.uploads == variantUploads, "a mixed array mapping copied or uploaded unchanged slices");
         writeCenter(address, depthBytes, 1, depthValue(0.875f));
         Require(sample(resource) == texture, "guest write replaced the mixed array view");
         expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 1), 0.875f, "mixed array retained old guest bytes");
+        expectRed(depthProgram.Red(alphaTexture->View(), alphaTexture->Layout(), 0, 1), 0.875f, "mixed array mappings do not share guest uploads");
         expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.75f, "guest write changed an unrelated layer");
         auto subset = resource;
         subset.baseArray = 2;
@@ -2946,6 +2981,11 @@ void depthArrayGuestTests(const Device& device, Recorder& recorder) {
         expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.125f, "mixed array ignored a newly rendered layer");
         Require(sample(subset) == subview, "rendering replaced a guest-only subview");
         expectRed(depthProgram.Red(subview->View(), subview->Layout(), 0), 0.125f, "guest-only subview ignored a newly rendered layer");
+        recorder.Sync();
+        ClearDepthSurfaces(context.device);
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.125f, "a surviving depth array view lost its backing");
+        expectRed(depthProgram.Red(alphaTexture->View(), alphaTexture->Layout(), 0, 1), 0.875f, "a surviving component view lost its backing");
+        expectRed(depthProgram.Red(subview->View(), subview->Layout(), 0), 0.125f, "a surviving single-layer array view lost its backing");
     }
 }
 
@@ -3197,6 +3237,19 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-array-failure-only") {
+            bool failed = false;
+            try {
+                depthArrayTests(device, recorder, true);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()) != "intentional depth test failure with pending copies") throw;
+                failed = true;
+            }
+            Require(failed, "the depth test did not exercise failure cleanup");
+            depthArrayTests(device, recorder);
+            std::cout << "Depth array failure cleanup and subsequent sampling tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--depth-array-only") {
             depthArrayTests(device, recorder);
             depthArrayGuestTests(device, recorder);
