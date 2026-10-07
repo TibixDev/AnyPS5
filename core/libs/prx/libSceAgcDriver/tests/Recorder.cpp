@@ -36,6 +36,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <time.h>
 #endif
 #include <algorithm>
 #include <array>
@@ -2458,10 +2459,28 @@ void resourceBuildBenchmark(const Device& device, bool shaderData = false, bool 
         const CompiledShader shader{ShaderRecompiler::ShaderStage::Fragment, &program, 0};
         ColorTarget target{};
         std::array<double, 9> times{};
+        std::array<double, 9> buildTimes{};
+        std::array<double, 9> retireTimes{};
+#ifndef _WIN32
+        const auto cpuUs = [](clockid_t clock) {
+            timespec time{};
+            Require(clock_gettime(clock, &time) == 0, "cannot read benchmark CPU time");
+            return static_cast<double>(time.tv_sec) * 1000000 + time.tv_nsec / 1000.0;
+        };
+        std::array<double, 9> threadTimes{};
+        std::array<double, 9> processTimes{};
+#endif
         std::uint64_t checksum = 0;
         for (std::size_t pass = 0; pass <= times.size(); ++pass) {
+#ifndef _WIN32
+            const auto threadStarted = cpuUs(CLOCK_THREAD_CPUTIME_ID);
+            const auto processStarted = cpuUs(CLOCK_PROCESS_CPUTIME_ID);
+#endif
             const auto started = std::chrono::steady_clock::now();
+            double buildUs = 0;
+            double retireUs = 0;
             for (unsigned batch = 0; batch < 32; ++batch) {
+                const auto buildStarted = std::chrono::steady_clock::now();
                 AgcDriver::GuestMemory::BumpCollectEpoch();
                 static_cast<void>(recorder.Commands());
                 for (unsigned draw = 0; draw < 32; ++draw) {
@@ -2472,14 +2491,35 @@ void resourceBuildBenchmark(const Device& device, bool shaderData = false, bool 
                     checksum += resources->LayoutKey().size();
                     recorder.Keep(std::move(resources));
                 }
+                const auto built = std::chrono::steady_clock::now();
+                buildUs += std::chrono::duration<double, std::micro>(built - buildStarted).count();
                 recorder.Sync();
                 gpu.unlock();
                 gpu.lock();
+                retireUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - built).count();
             }
-            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / 1024;
+            if (pass != 0) {
+                times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / 1024;
+                buildTimes[pass - 1] = buildUs / 1024;
+                retireTimes[pass - 1] = retireUs / 1024;
+#ifndef _WIN32
+                threadTimes[pass - 1] = (cpuUs(CLOCK_THREAD_CPUTIME_ID) - threadStarted) / 1024;
+                processTimes[pass - 1] = (cpuUs(CLOCK_PROCESS_CPUTIME_ID) - processStarted) / 1024;
+#endif
+            }
         }
         std::sort(times.begin(), times.end());
-        std::cout << (shaderData ? "Shader data batches (" : failedImports ? "Failed import batches (" : "Resource batches (") << inputBytes << " byte inputs, " << imageCount << " textures): median " << times[4] << " us/draw, p95 pass " << times[8] << " us/draw, minimum " << times[0] << " us, checksum " << checksum << '\n';
+        std::sort(buildTimes.begin(), buildTimes.end());
+        std::sort(retireTimes.begin(), retireTimes.end());
+#ifndef _WIN32
+        std::sort(threadTimes.begin(), threadTimes.end());
+        std::sort(processTimes.begin(), processTimes.end());
+#endif
+        std::cout << (shaderData ? "Shader data batches (" : failedImports ? "Failed import batches (" : "Resource batches (") << inputBytes << " byte inputs, " << imageCount << " textures): median " << times[4] << " us/draw, p95 pass " << times[8] << " us/draw, minimum " << times[0] << " us, checksum " << checksum << ", build " << buildTimes[4] << " us/draw, retire " << retireTimes[4] << " us/draw";
+#ifndef _WIN32
+        std::cout << ", thread CPU " << threadTimes[4] << " us/draw, process CPU " << processTimes[4] << " us/draw";
+#endif
+        std::cout << '\n';
     }
     }
 }
