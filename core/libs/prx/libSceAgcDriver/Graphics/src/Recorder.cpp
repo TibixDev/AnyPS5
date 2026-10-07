@@ -2208,7 +2208,7 @@ void Recorder::BoundKeptBytes() {
 
 std::pair<std::shared_ptr<Buffer>, std::size_t> Recorder::AllocateDrawUpload(std::size_t bytes) {
     constexpr std::size_t pageBytes = 65536;
-    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     Require(bytes != 0 && bytes <= context.limits.maxStorageBufferRange, "invalid draw upload size");
     ensureOpen();
     static const bool pooled = std::getenv("APS5_NO_DRAW_UPLOAD_POOL") == nullptr;
@@ -2217,7 +2217,7 @@ std::pair<std::shared_ptr<Buffer>, std::size_t> Recorder::AllocateDrawUpload(std
         open->kept.push_back(buffer);
         return {std::move(buffer), 0};
     }
-    const auto alignment = static_cast<std::size_t>(context.limits.minStorageBufferOffsetAlignment);
+    const auto alignment = std::max<std::size_t>(4, context.limits.minStorageBufferOffsetAlignment);
     auto offset = (open->drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (open->drawUpload == nullptr || offset > pageBytes || bytes > pageBytes - offset) {
         auto buffer = std::make_shared<Buffer>(context, pageBytes, usage);
