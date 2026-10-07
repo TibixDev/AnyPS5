@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -142,6 +143,123 @@ static void TestPcmBlockEnd() {
     Require(sceNgs2VoiceGetState(sampler, &state.voice_state, sizeof(state)) == SCE_NGS2_OK);
     Require(state.num_decoded_samples == pcm.size() && state.waveform_data == pcm.data() + pcm.size());
     Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+}
+
+static bool Near(float a, float b) {
+    return std::fabs(a - b) < 1e-4f;
+}
+
+static bool PanThrows(Ngs2PanWork& work, const Ngs2PanParam& param, std::uint32_t format) {
+    float out[8] = {};
+    try { sceNgs2PanGetVolumeMatrix(&work, &param, 1, format, out); } catch (const std::exception&) { return true; }
+    return false;
+}
+
+static bool PanInitThrows(const float* angles, float unitAngle, std::uint32_t numSpeakers) {
+    Ngs2PanWork work{};
+    try { sceNgs2PanInit(&work, angles, unitAngle, numSpeakers); } catch (const std::exception&) { return true; }
+    return false;
+}
+
+static void TestPan() {
+    const float pi = 3.14159265f;
+    const float half = std::sqrt(0.5f);
+    Ngs2PanWork work{};
+    Require(sceNgs2PanInit(&work, nullptr, 360.0f, 2) == SCE_NGS2_OK);
+    Require(work.num_speakers == 2 && work.unit_angle == 360.0f && Near(work.speaker_angles[0], -90.0f) && Near(work.speaker_angles[1], 90.0f));
+    const Ngs2PanParam params[] = {
+        {270.0f, 1.0f, 1.0f, 0.0f},
+        {90.0f, 1.0f, 1.0f, 0.0f},
+        {0.0f, 1.0f, 1.0f, 0.0f},
+        {315.0f, 1.0f, 1.0f, 0.0f},
+        {180.0f, 1.0f, 1.0f, 0.0f},
+        {270.0f, 1.0f, 0.5f, 0.0f},
+        {135.0f, 1.0f, 1.0f, 0.0f},
+    };
+    float stereo[14] = {};
+    Require(sceNgs2PanGetVolumeMatrix(&work, params, 7, 2, nullptr) == SCE_NGS2_ERROR_INVALID_OUT_ADDRESS);
+    Require(sceNgs2PanGetVolumeMatrix(&work, params, 0, 2, stereo) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, nullptr, 0, 2, stereo) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, params, 7, 2, stereo) == SCE_NGS2_OK);
+    Require(Near(stereo[0], 1.0f) && Near(stereo[1], 0.0f));
+    Require(Near(stereo[2], 0.0f) && Near(stereo[3], 1.0f));
+    Require(Near(stereo[4], half) && Near(stereo[5], half));
+    Require(Near(stereo[6], std::cos(pi / 8.0f)) && Near(stereo[7], std::sin(pi / 8.0f)));
+    Require(Near(stereo[8], half) && Near(stereo[9], half));
+    Require(Near(stereo[10], 0.5f) && Near(stereo[11], 0.0f));
+    Require(Near(stereo[12], std::sin(pi / 8.0f)) && Near(stereo[13], std::cos(pi / 8.0f)));
+
+    float out[8] = {};
+    Require(sceNgs2PanInit(&work, nullptr, 2.0f * pi, 2) == SCE_NGS2_OK && Near(work.speaker_angles[0], -pi / 2.0f));
+    const Ngs2PanParam radiansLeft{1.5f * pi, 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanGetVolumeMatrix(&work, &radiansLeft, 1, 2, out) == SCE_NGS2_OK && Near(out[0], 1.0f) && Near(out[1], 0.0f));
+
+    const float leftRight[] = {270.0f, 90.0f};
+    const Ngs2PanParam left{270.0f, 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanInit(&work, leftRight, 360.0f, 2) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, &left, 1, 2, out) == SCE_NGS2_OK && Near(out[0], 1.0f) && Near(out[1], 0.0f));
+
+    const float mono[] = {0.0f};
+    Require(sceNgs2PanInit(&work, mono, 360.0f, 1) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, &left, 1, 1, out) == SCE_NGS2_OK && Near(out[0], 1.0f));
+
+    const float surround[] = {-pi / 6.0f, pi / 6.0f, 0.0f, -110.0f * pi / 180.0f, 110.0f * pi / 180.0f};
+    Require(sceNgs2PanInit(&work, surround, 2.0f * pi, 5) == SCE_NGS2_OK);
+    const Ngs2PanParam front{0.0f, 1.0f, 1.0f, 0.5f};
+    Require(sceNgs2PanGetVolumeMatrix(&work, &front, 1, 6, out) == SCE_NGS2_OK);
+    Require(Near(out[0], 0.0f) && Near(out[1], 0.0f) && Near(out[2], 1.0f) && Near(out[3], 0.5f) && Near(out[4], 0.0f) && Near(out[5], 0.0f));
+    const Ngs2PanParam back{pi, 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanGetVolumeMatrix(&work, &back, 1, 6, out) == SCE_NGS2_OK);
+    Require(Near(out[2], 0.0f) && Near(out[3], 0.0f) && Near(out[4], half) && Near(out[5], half));
+    const Ngs2PanParam rightSide{60.0f * pi / 180.0f, 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanGetVolumeMatrix(&work, &rightSide, 1, 6, out) == SCE_NGS2_OK);
+    Require(Near(out[1], std::cos(0.375f * pi / 2.0f)) && Near(out[5], std::sin(0.375f * pi / 2.0f)) && Near(out[0], 0.0f) && Near(out[4], 0.0f));
+
+    const float unsorted[] = {110.0f, -30.0f, 0.0f, 30.0f, -110.0f};
+    const Ngs2PanParam between{70.0f, 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanInit(&work, unsorted, 360.0f, 5) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, &between, 1, 6, out) == SCE_NGS2_OK);
+    Require(Near(out[0], half) && Near(out[4], half) && Near(out[1], 0.0f) && Near(out[2], 0.0f) && Near(out[5], 0.0f));
+
+    const float surround71[] = {-30.0f, 30.0f, 0.0f, -90.0f, 90.0f, -150.0f, 150.0f};
+    const Ngs2PanParam behind{180.0f, 1.0f, 1.0f, 0.25f};
+    Require(sceNgs2PanInit(&work, surround71, 360.0f, 7) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, &behind, 1, 8, out) == SCE_NGS2_OK);
+    Require(Near(out[6], half) && Near(out[7], half) && Near(out[3], 0.25f) && Near(out[2], 0.0f) && Near(out[5], 0.0f));
+
+    const float coincident[] = {0.0f, 0.0f, 90.0f, 180.0f, -90.0f};
+    const Ngs2PanParam diagonal{45.0f, 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanInit(&work, coincident, 360.0f, 5) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, &diagonal, 1, 6, out) == SCE_NGS2_OK);
+    Require(Near(out[2], half) && Near(out[0] * out[0] + out[1] * out[1], 0.5f));
+    const Ngs2PanParam onShared{0.0f, 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanGetVolumeMatrix(&work, &onShared, 1, 6, out) == SCE_NGS2_OK);
+    Require(Near(out[0] * out[0] + out[1] * out[1], 1.0f) && Near(out[2], 0.0f) && Near(out[4], 0.0f) && Near(out[5], 0.0f));
+    const float sharedLowest[] = {-120.0f, -120.0f, 0.0f, 60.0f, 120.0f};
+    const Ngs2PanParam onLowest{-120.0f, 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanInit(&work, sharedLowest, 360.0f, 5) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, &onLowest, 1, 6, out) == SCE_NGS2_OK);
+    Require(Near(out[0] * out[0] + out[1] * out[1], 1.0f) && Near(out[2], 0.0f) && Near(out[4], 0.0f) && Near(out[5], 0.0f));
+
+    Require(PanThrows(work, Ngs2PanParam{0.0f, 0.5f, 1.0f, 0.0f}, 6) && PanThrows(work, Ngs2PanParam{NAN, 1.0f, 1.0f, 0.0f}, 6));
+    Require(PanThrows(work, front, 4) && PanThrows(work, front, 2) && !PanThrows(work, front, 6));
+    Require(PanInitThrows(nullptr, 360.0f, 5) && PanInitThrows(nullptr, 360.0f, 0) && PanInitThrows(surround71, 360.0f, 8));
+    Require(PanInitThrows(nullptr, 0.0f, 2) && PanInitThrows(nullptr, NAN, 2));
+    const float invalid[] = {0.0f, NAN};
+    Require(PanInitThrows(invalid, 360.0f, 2));
+    work.speaker_angles[0] = NAN;
+    Require(PanThrows(work, front, 6));
+    Require(sceNgs2PanInit(&work, leftRight, 360.0f, 2) == SCE_NGS2_OK);
+    Require(sceNgs2PanInit(&work, work.speaker_angles, 360.0f, 2) == SCE_NGS2_OK);
+    Require(work.speaker_angles[0] == 270.0f && work.speaker_angles[1] == 90.0f);
+    const float extreme[] = {-std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    const Ngs2PanParam huge{std::numeric_limits<float>::max(), 1.0f, 1.0f, 0.0f};
+    Require(sceNgs2PanInit(&work, extreme, std::numeric_limits<float>::min(), 2) == SCE_NGS2_OK);
+    Require(sceNgs2PanGetVolumeMatrix(&work, &huge, 1, 2, out) == SCE_NGS2_OK);
+    Require(std::isfinite(out[0]) && std::isfinite(out[1]) && Near(out[0] * out[0] + out[1] * out[1], 1.0f));
+    bool nullWork = false;
+    try { sceNgs2PanGetVolumeMatrix(nullptr, &front, 1, 2, out); } catch (const std::exception&) { nullWork = true; }
+    Require(nullWork);
 }
 
 static void TestPitchAndRepeat() {
@@ -361,6 +479,7 @@ static void TestAllocator() {
 int main() {
     TestErrorsAndInfo();
     TestPcmBlockEnd();
+    TestPan();
     TestPitchAndRepeat();
     TestSubmixerMatrix();
     TestSampleRate();
