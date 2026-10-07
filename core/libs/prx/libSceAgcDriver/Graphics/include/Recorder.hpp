@@ -94,13 +94,14 @@ public:
     // neither the mutex nor the recorder nor a particular thread. ~Recorder joins the release
     // thread and waits for every release in progress before the device goes.
     void Keep(std::shared_ptr<void> object);
+    std::pair<std::shared_ptr<Buffer>, std::size_t> AllocateDrawUpload(std::size_t bytes);
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
     static constexpr std::size_t DrawSnapshotBudget = std::size_t{256} << 20u;
     static constexpr std::size_t DrawSnapshotEntries = 1024;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
-    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::size_t* offset = nullptr);
+    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0, std::size_t offset = 0);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
@@ -491,6 +492,8 @@ private:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
+        std::shared_ptr<Buffer> drawUpload;
+        std::size_t drawUploadUsed = 0;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
@@ -747,6 +750,7 @@ private:
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived;
+        std::size_t offset;
     };
     struct DrawSnapshotPool {
         std::list<DrawSnapshotKey> recency;
