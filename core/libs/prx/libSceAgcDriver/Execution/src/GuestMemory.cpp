@@ -929,6 +929,25 @@ struct WriteTracker {
 #endif
     }
 
+    bool unchanged(std::uint64_t first, std::uint64_t last, std::uint64_t since) const {
+        if (first == last) return stampOf(first) <= since;
+        const auto newer = [since](std::uint32_t stamp) { return stamp > since; };
+#ifdef _WIN32
+        return std::none_of(blocks.begin() + first, blocks.begin() + last + 1, newer);
+#else
+        while (first <= last) {
+            const auto index = first / LeafBlocks;
+            const auto end = std::min<std::uint64_t>(last + 1, (index + 1) * LeafBlocks);
+            if (const auto& leaf = leaves[index]; leaf != nullptr) {
+                const auto begin = leaf->blocks.begin() + first % LeafBlocks;
+                if (std::any_of(begin, begin + (end - first), newer)) return false;
+            }
+            first = end;
+        }
+        return true;
+#endif
+    }
+
     std::uint32_t cpuStampOf(std::uint64_t block) const {
 #ifdef _WIN32
         return cpuBlocks[block];
@@ -1205,10 +1224,7 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
-    for (auto block = first; block <= last; ++block) {
-        if (tracker.stampOf(block) > generation) return false;
-    }
-    return true;
+    return tracker.unchanged(first, last, generation);
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
@@ -1220,9 +1236,7 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
         if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
         const auto first = tracker.blockOf(address);
         const auto last = tracker.blockOf(address + bytes - 1);
-        for (auto block = first; block <= last; ++block) {
-            if (tracker.stampOf(block) > generation) return false;
-        }
+        if (!tracker.unchanged(first, last, generation)) return false;
     }
     return true;
 }

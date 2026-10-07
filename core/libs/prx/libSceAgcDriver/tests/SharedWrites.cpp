@@ -84,6 +84,32 @@ void benchmark(bool labels = false) {
     }
 }
 
+void benchmarkVersions() {
+    require(WriteWatched(), "write tracking unavailable for version benchmark");
+    std::thread([] {}).join();
+    Mapping mapping(64u << 20u);
+    std::memset(mapping.data, 17, mapping.size);
+    constexpr unsigned iterations = 16384;
+    for (const auto blocks : {1u, 16u, 64u, 512u, 1024u}) {
+        const std::size_t bytes = blocks * 65536u;
+        for (const auto dirty : {0u, 1u, 2u}) {
+            const auto generation = CollectWritesUncached(mapping.Address(), bytes);
+            require(generation != 0, "version benchmark could not collect watched memory");
+            if (dirty != 0) require(MarkWritten(mapping.Address() + (dirty == 1 ? 0 : bytes - 1), 1) > generation, "version benchmark write was not stamped");
+            std::array<double, 9> times{};
+            std::uint64_t unchanged = 0;
+            for (unsigned pass = 0; pass <= times.size(); ++pass) {
+                const auto started = std::chrono::steady_clock::now();
+                for (unsigned i = 0; i < iterations; ++i) unchanged += UnchangedSince(mapping.Address(), bytes, generation);
+                if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - started).count() / iterations;
+            }
+            require(unchanged == (dirty == 0 ? (times.size() + 1) * iterations : 0), "version benchmark returned stale memory");
+            std::ranges::sort(times);
+            std::cout << "Version scan blocks=" << blocks << " dirty=" << dirty << " median_ns=" << times[4] << " p95_ns=" << times.back() << "\n";
+        }
+    }
+}
+
 void smallStores() {
     Mapping mapping(2u << 16u);
     auto* data = static_cast<std::byte*>(mapping.data);
@@ -205,6 +231,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark") benchmark();
         else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-labels") benchmark(true);
+        else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-versions") benchmarkVersions();
         else {
 #ifndef _WIN32
             const auto before = directMappings();

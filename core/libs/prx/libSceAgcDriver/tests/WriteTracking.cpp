@@ -15,6 +15,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -26,17 +27,20 @@ void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-void* AllocateWatched(std::size_t bytes) {
+void* AllocateWatched(std::size_t bytes, bool crossLeaf = false) {
 #ifdef _WIN32
+    static_cast<void>(crossLeaf);
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block);
     GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
-    void* raw = mmap(nullptr, bytes + Block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    const std::size_t alignment = crossLeaf ? std::size_t{1} << 32 : Block;
+    const auto prefix = crossLeaf ? Block : 0;
+    void* raw = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) throw std::runtime_error("cannot map the watched block");
     const auto begin = reinterpret_cast<std::uintptr_t>(raw);
-    const auto aligned = (begin + Block - 1) & ~static_cast<std::uintptr_t>(Block - 1);
+    const auto aligned = ((begin + prefix + alignment - 1) & ~static_cast<std::uintptr_t>(alignment - 1)) - prefix;
     if (aligned != begin) munmap(raw, aligned - begin);
-    if (aligned + bytes != begin + bytes + Block) munmap(reinterpret_cast<void*>(aligned + bytes), begin + Block - aligned);
+    if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
     void* block = reinterpret_cast<void*>(aligned);
     GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
 #endif
@@ -117,6 +121,66 @@ void CheckOwnStore() {
     CollectWritesUncached(base, 2 * Block);
     Require(!UnchangedSince(base, 64, beforeCpu), "a CPU write after the driver store is not seen");
 }
+
+void CheckVersionRanges() {
+    constexpr std::size_t count = 80;
+    constexpr auto bytes = count * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes, true));
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() {
+#ifdef _WIN32
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+            munmap(memory, bytes);
+#endif
+        }
+    } cleanup{memory};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(UnchangedSince(base, bytes, TrackerGeneration()), "a new range has newer version stamps");
+    std::memset(memory, 17, bytes);
+    const auto initial = CollectWritesUncached(base, bytes);
+    Require(initial != 0, "version ranges could not be collected");
+    struct Write { std::size_t block; std::uint64_t generation; };
+    std::vector<Write> history;
+    std::vector<std::uint64_t> checkpoints{initial};
+    std::uint32_t random = 0x61387a29;
+    const auto next = [&] { random = random * 1664525u + 1013904223u; return random; };
+    const auto expected = [&](const UnchangedQuery& query) {
+        if (query.generation == 0) return false;
+        for (const auto& write : history) {
+            const auto begin = base + write.block * Block;
+            if (write.generation > query.generation && begin < query.address + query.bytes && query.address < begin + Block) return false;
+        }
+        return true;
+    };
+    for (unsigned step = 0; step < 512; ++step) {
+        const auto block = step < 3 ? step : next() % count;
+        std::uint64_t generation;
+        if (step % 3 == 0) {
+            memory[block * Block + 9] ^= 1;
+            generation = CollectWritesUncached(base + block * Block, Block);
+        } else generation = MarkWritten(base + block * Block + 13, 4);
+        Require(generation > checkpoints.back(), "version range write did not advance the tracker");
+        history.push_back({block, generation});
+        checkpoints.push_back(generation);
+        for (unsigned check = 0; check < 16; ++check) {
+            std::array<UnchangedQuery, 3> queries;
+            bool all = true;
+            for (auto& query : queries) {
+                const auto offset = next() % bytes;
+                query = {base + offset, 1 + next() % (bytes - offset), checkpoints[next() % checkpoints.size()]};
+                const auto same = expected(query);
+                Require(UnchangedSince(query.address, query.bytes, query.generation) == same, "version range disagrees with write history");
+                all = all && same;
+            }
+            Require(UnchangedSinceAll(queries) == all, "batched version ranges disagree with write history");
+        }
+    }
+    Require(!UnchangedSince(base, bytes, 0), "an unknown generation was accepted");
+    Require(UnchangedSince(base, bytes, checkpoints.back()), "the latest checkpoint was rejected");
+}
 }
 
 int main() {
@@ -127,6 +191,7 @@ int main() {
         }
         CheckSharedBlock();
         CheckOwnStore();
+        CheckVersionRanges();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;
