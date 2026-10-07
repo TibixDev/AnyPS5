@@ -1148,7 +1148,7 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
         if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
-                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                const bool written = element >= binding.Usage().bufferWritten.size() || binding.Usage().bufferWritten[element];
                 const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
                 if (written || empty) key.insert(key.end(), words, words + 4);
                 else key.insert(key.end(), {0u, words[1] & 0xffff0000u, 0u, words[3]});
@@ -1156,13 +1156,13 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
         } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
             key.insert(key.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
         }
-        packBits(binding.imageWritten);
-        packBits(binding.samplerDepthCompare);
-        packBits(binding.imageDepthCompare);
-        packBits(binding.imageAtomic);
+        packBits(binding.Usage().imageWritten);
+        packBits(binding.Usage().samplerDepthCompare);
+        packBits(binding.Usage().imageDepthCompare);
+        packBits(binding.Usage().imageAtomic);
         // Read-only elements are bound without a write set: an object built for one written set
         // must not serve a build with another (the variant implies it, this makes it explicit).
-        packBits(binding.bufferWritten);
+        packBits(binding.Usage().bufferWritten);
     }
     return key;
 }
@@ -1681,7 +1681,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                         const auto resource = DecodeTextureResource(words);
                         const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
-                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) != textures[textureIndex]) return false;
+                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.Usage().imageDepthCompare.empty() && binding.Usage().imageDepthCompare.at(element)) != textures[textureIndex]) return false;
                         ++textureIndex;
                     }
                 } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
@@ -2336,7 +2336,7 @@ void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding&
         Require(binding.guestDescriptor.size() == operation.imageAllocations.size() * 4, "guest sampler descriptor must contain 4 dwords");
         for (std::size_t element = 0; element < operation.imageAllocations.size(); ++element) {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 4, 4);
-            const bool compareEnable = binding.samplerDepthCompare.at(element);
+            const bool compareEnable = binding.Usage().samplerDepthCompare.at(element);
             static const bool noSamplerCache = std::getenv("APS5_NO_SAMPLER_CACHE") != nullptr;
             if (context.samplerCache != nullptr && !noSamplerCache) samplers.push_back(context.samplerCache->Get(context, words, compareEnable));
             else {
@@ -2401,7 +2401,7 @@ bool ShaderResources::precollectImages() {
                 record.guestBytes = DescribeSurface(record.resource).guestBytes;
                 record.generation = GuestMemory::CollectWrites(record.resource.baseAddress, static_cast<std::size_t>(record.guestBytes));
                 record.decoded = true;
-                if (record.sampled && !noRecords && words.size() == 8 && (binding.imageDepthCompare.empty() || !binding.imageDepthCompare.at(element))) {
+                if (record.sampled && !noRecords && words.size() == 8 && (binding.Usage().imageDepthCompare.empty() || !binding.Usage().imageDepthCompare.at(element))) {
                     std::copy(words.begin(), words.end(), record.words.begin());
                     record.components = {ComponentSwizzleFor(record.resource.dstSelX), ComponentSwizzleFor(record.resource.dstSelY), ComponentSwizzleFor(record.resource.dstSelZ), ComponentSwizzleFor(record.resource.dstSelW)};
                     record.keys = TextureClearKeys(record.resource, record.guestBytes);
@@ -2500,7 +2500,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 texture = fastTexture(*record);
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
-            if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
+            if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, !binding.Usage().imageDepthCompare.empty() && binding.Usage().imageDepthCompare.at(element));
             textures.push_back(std::move(texture));
             textureFirstLayer.push_back(firstLayer);
             describedRanges.push_back({"texture", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
@@ -2533,8 +2533,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);
         // Images the shader only reads have nothing to store back.
-        storageWritten.push_back(element >= binding.imageWritten.size() || binding.imageWritten[element]);
-        storageAtomic.push_back(element < binding.imageAtomic.size() && binding.imageAtomic[element]);
+        storageWritten.push_back(element >= binding.Usage().imageWritten.size() || binding.Usage().imageWritten[element]);
+        storageAtomic.push_back(element < binding.Usage().imageAtomic.size() && binding.Usage().imageAtomic[element]);
         describedRanges.push_back({"storage", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
     }
 }
@@ -2649,7 +2649,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                     return std::nullopt;
                 }
                 if (item.address == address && item.size == size) continue;
-                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                const bool written = element >= binding.Usage().bufferWritten.size() || binding.Usage().bufferWritten[element];
                 if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(size) + item.adjustment;

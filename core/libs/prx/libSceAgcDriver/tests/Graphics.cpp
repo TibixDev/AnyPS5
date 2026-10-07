@@ -1509,8 +1509,7 @@ void bindingPlanTests() {
     vertex.variantId = 1;
     fragment.variantId = 2;
     vertex.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32))));
-    vertex.bindings.front().bufferWritten = {false, true};
-    vertex.bindings.front().bufferAtomic = {false, true};
+    vertex.bindings.front().usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferAtomic = {false, true}, .bufferWritten = {false, true}});
     vertex.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, {7, 8, 9}));
     fragment.bindings.push_back(makeBinding(Role::FlattenedSrt, 43, 1, {1, 2}));
     std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 8}}};
@@ -1540,7 +1539,7 @@ void bindingPlanTests() {
     images.bindings.push_back(sampled);
     auto sampler = makeBinding(Role::GuestSamplers, 4, 1, std::vector<std::uint32_t>(4));
     sampler.kind = Kind::Sampler;
-    sampler.samplerDepthCompare = {false};
+    sampler.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.samplerDepthCompare = {false}});
     images.bindings.push_back(sampler);
     sampled.binding = 7;
     images.bindings.push_back(sampled);
@@ -1556,7 +1555,7 @@ void bindingPlanTests() {
         program.variantId = 20;
         program.pushConstants.resize(4);
         program.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16)));
-        program.bindings.front().bufferWritten = {false};
+        program.bindings.front().usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferWritten = {false}});
         const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         ShaderResources before(context, shader);
         const auto beforeWrite = findWrite(0);

@@ -572,7 +572,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u};
-    binding.bufferWritten = {true};
+    binding.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferWritten = {true}});
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     auto direct = std::make_shared<ShaderResources>(context, compute);
@@ -1478,7 +1478,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
-    binding.bufferWritten = {false};
+    binding.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferWritten = {false}});
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     {
@@ -1595,7 +1595,7 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     binding.count = 2;
     for (const auto word : words(address + outer, outerBytes)) binding.guestDescriptor.push_back(word);
     for (const auto word : words(address + offset, elementBytes)) binding.guestDescriptor.push_back(word);
-    binding.bufferWritten = {false, false};
+    binding.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferWritten = {false, false}});
     program.bindings.push_back(binding);
     program.pushConstants.resize(16);
     program.memoryOffsetDword = 0;
@@ -1799,7 +1799,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         sampler.binding = 11;
         sampler.count = 2;
         sampler.guestDescriptor.resize(8);
-        sampler.samplerDepthCompare = {false, false};
+        sampler.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.samplerDepthCompare = {false, false}});
         program.bindings.push_back(sampler);
         const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         ShaderResources resources(context, shader);
@@ -1857,7 +1857,7 @@ void shaderDataSliceTests(const Device& device, Recorder& outer) {
     buffers.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
     buffers.binding = 0;
     buffers.count = 2;
-    buffers.bufferWritten = {false, false};
+    buffers.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferWritten = {false, false}});
     for (const auto [pointer, bytes] : {std::pair{guest.data(), 32u}, std::pair{guest.data() + 1, 8u}}) {
         const auto address = reinterpret_cast<std::uint64_t>(pointer);
         for (auto word : {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), bytes, 0x31016facu}) buffers.guestDescriptor.push_back(word);
@@ -1986,7 +1986,7 @@ void copiedBufferResidencyTests(const Device& device, Recorder& outer) {
     binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
     binding.binding = 0;
     binding.count = 2;
-    binding.bufferWritten = {false, false};
+    binding.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferWritten = {false, false}});
     for (auto word : descriptor(address, 8192)) binding.guestDescriptor.push_back(word);
     for (auto word : descriptor(address + 4, 64)) binding.guestDescriptor.push_back(word);
     program.bindings.push_back(binding);
@@ -2037,7 +2037,9 @@ void copiedBufferResidencyTests(const Device& device, Recorder& outer) {
     Require(remapped.buffer != stored.buffer || remapped.offset != stored.offset, "copied residency survived a mapping generation change");
     auto writerProgram = program;
     writerProgram.variantId = 1000011;
-    writerProgram.bindings.front().bufferWritten[1] = true;
+    auto writerUsage = writerProgram.bindings.front().Usage();
+    writerUsage.bufferWritten[1] = true;
+    writerProgram.bindings.front().usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(std::move(writerUsage));
     const CompiledShader writerShader{ShaderRecompiler::ShaderStage::Compute, &writerProgram, 0};
     ShaderResources writer(context, writerShader);
     Require(writer.HasCopiedWrites() && updates.calls.back().buffers.at({0, 0}).buffer != remapped.buffer, "an overlapping writer reused immutable read-only storage");
@@ -2191,7 +2193,7 @@ void resourceBuildBenchmark(const Device& device, bool shaderData = false, bool 
             binding.role = shaderData ? (i % 2 == 0 ? ShaderRecompiler::DescriptorRole::ShaderData : ShaderRecompiler::DescriptorRole::FlattenedSrt) : ShaderRecompiler::DescriptorRole::GuestBuffers;
             binding.binding = i;
             binding.count = 1;
-            binding.bufferWritten = {false};
+            binding.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferWritten = {false}});
             const auto base = address + i * inputBytes;
             binding.guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32), inputBytes, 0x31016fac};
             if (shaderData) binding.guestDescriptor.resize(inputBytes / 4, i + 1);
@@ -2280,7 +2282,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
-    binding.bufferWritten = {false};
+    binding.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.bufferWritten = {false}});
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     {
