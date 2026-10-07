@@ -290,6 +290,12 @@ target_link_libraries(agc_vertex_input_tests PRIVATE shader_recompiler_agc_drive
 set_target_properties(agc_vertex_input_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_vertex_input_tests)
 
+add_test_executable(agc_vertex_stage_tests EXCLUDE_FROM_ALL tests/VertexStage.cpp)
+target_include_directories(agc_vertex_stage_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_vertex_stage_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_vertex_stage_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_vertex_stage_tests)
+
 add_test_executable(agc_result_memo_tests EXCLUDE_FROM_ALL tests/ResultMemo.cpp)
 target_link_libraries(agc_result_memo_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_result_memo_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -609,7 +615,7 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
 endforeach()
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_shared_write_tests agc_vertex_input_tests agc_driver_tests agc_driver_draw_plan_tests agc_shader_memory_tests agc_result_memo_tests agc_binding_materialization_tests agc_srt_execution_tests agc_structurizer_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests ${agcExecutionTests})
+    foreach(agcTest IN ITEMS agc_vertex_stage_tests agc_shared_write_tests agc_vertex_input_tests agc_driver_tests agc_driver_draw_plan_tests agc_shader_memory_tests agc_result_memo_tests agc_binding_materialization_tests agc_srt_execution_tests agc_structurizer_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests ${agcExecutionTests})
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
