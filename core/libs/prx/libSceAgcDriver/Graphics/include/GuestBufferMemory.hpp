@@ -32,6 +32,7 @@ struct HostImport {
     std::uint64_t serial = 0;
     bool unwatched = false;
     bool dmaBuf = false;
+    std::weak_ptr<const GuestAllocations::Range> range;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };

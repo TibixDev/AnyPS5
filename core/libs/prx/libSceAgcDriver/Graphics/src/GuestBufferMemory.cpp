@@ -125,7 +125,7 @@ struct HostImports {
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
-    std::set<std::uint64_t> failed;
+    std::map<std::uint64_t, std::weak_ptr<const GuestAllocations::Range>> failed;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
@@ -341,6 +341,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
+    const auto owner = std::lower_bound(lease.begin(), lease.end(), base, [](const auto& range, std::uint64_t address) { return range->address < address; });
+    Require(owner != lease.end() && (*owner)->address == base && (*owner)->bytes == bytes, "host import has no matching allocation lease");
     // Pinned imports count against the driver's system memory budget; past it ordinary host
     // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
     // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
@@ -372,7 +374,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-            state.failed.insert(base);
+            state.failed.emplace(base, *owner);
             return nullptr;
         }
         const auto protection = info.Protect & 0xffu;
@@ -384,7 +386,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) {
-        state.failed.insert(base);
+        state.failed.emplace(base, *owner);
         return nullptr;
     }
     if (!writable) {
@@ -414,7 +416,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
-        state.failed.insert(base);
+        state.failed.emplace(base, *owner);
         std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -445,7 +447,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     std::uint64_t liveBytes = bytes;
     for (const auto& [address, existing] : state.imports) liveBytes += existing.bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok via %s (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), entry.dmaBuf ? "dma-buf" : "host pointer", state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
     return &state.imports.emplace(base, entry).first->second;
 }
 
@@ -500,7 +502,10 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         retireImport(context, state, it, lease);
         it = next;
     }
-    for (auto it = state.failed.begin(); it != state.failed.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.failed.begin(); it != state.failed.end();) {
+        const auto* range = leasedRangeAt(lease, it->first);
+        it = range != nullptr && range == it->second.lock().get() ? std::next(it) : state.failed.erase(it);
+    }
 }
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
