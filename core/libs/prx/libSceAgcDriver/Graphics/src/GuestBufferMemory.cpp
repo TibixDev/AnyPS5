@@ -532,7 +532,12 @@ bool importsStale(const Context& context, const HostImports& state) {
     return state.device != context.device || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration;
 }
 
-bool failedAllocationContains(const HostImports& state, std::uint64_t begin, std::uint64_t end) {
+bool knownImportFailure(const Context& context, const HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    const auto [first, last] = importBounds(context, begin, end);
+    if (first < last) {
+        const auto exact = state.failed.find({first, last - first});
+        if (exact != state.failed.end() && exact->second.size() > 1) return true;
+    }
     auto found = state.failed.upper_bound({begin, std::numeric_limits<std::uint64_t>::max()});
     if (found == state.failed.begin()) return false;
     --found;
@@ -1258,7 +1263,7 @@ std::shared_ptr<HostImport> HostImportFor(const Context& context, std::uint64_t 
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto entry = findImport(state, address, address + bytes)) return entry;
-        if (failedAllocationContains(state, address, address + bytes)) return nullptr;
+        if (knownImportFailure(context, state, address, address + bytes)) return nullptr;
         const auto [first, last] = importBounds(context, address, address + bytes);
         const auto lease = first < last ? GuestAllocations::GuestAllocationsAcquireSpan_nid_postfix(first, last - first) : GuestAllocations::Lease{};
         if (!importsStale(context, state)) {
@@ -2132,7 +2137,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             std::shared_ptr<HostImport> entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
-            if (entry == nullptr && (importsStale(context, state) || !failedAllocationContains(state, region.begin, region.end))) {
+            if (entry == nullptr && (importsStale(context, state) || !knownImportFailure(context, state, region.begin, region.end))) {
                 GuestAllocations::Lease targeted;
                 const bool haveLease = !lease.empty() || space != nullptr || !acquired.empty();
                 if (!haveLease) {

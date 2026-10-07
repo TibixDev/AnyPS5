@@ -1664,6 +1664,11 @@ private:
 };
 
 void failedImportTests(const Device& device) {
+#ifdef _WIN32
+    constexpr bool multipleRanges = false;
+#else
+    constexpr bool multipleRanges = true;
+#endif
     auto context = device.GetContext();
     context.hostImportAlignment = 4096;
     context.dmaBufImport = false;
@@ -1701,27 +1706,73 @@ void failedImportTests(const Device& device) {
     for (std::size_t i = 0; i < 100; ++i) read(i * 16, 64);
     Require(rejectedImports == 1, "unchanged allocation retried a failed import");
     read(2 * unit - 4, 16);
-    Require(rejectedImports == 2, "cross-allocation request reused a failure for a different span");
+    Require(rejectedImports == (multipleRanges ? 2 : 1), "cross-allocation request reused a failure for a different span");
+    for (unsigned i = 0; i < 100; ++i) read(2 * unit - 4, 16);
+    Require(rejectedImports == (multipleRanges ? 2 : 1), "unchanged multi-mapping span retried a failed import");
     read(2 * unit, 64);
-    Require(rejectedImports == 3, "partial cross-allocation failure disqualified another whole allocation");
+    Require(rejectedImports == (multipleRanges ? 3 : 2), "partial cross-allocation failure disqualified another whole allocation");
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
         mutation.Add(block, 2 * unit, true, true);
     }
     read(4, 64);
-    Require(rejectedImports == 4, "replacement mapping retained the old transport decision");
+    Require(rejectedImports == (multipleRanges ? 4 : 3), "replacement mapping retained the old transport decision");
+    read(2 * unit - 4, 16);
+    Require(rejectedImports == (multipleRanges ? 5 : 3), "multi-mapping span retained a failure after one mapping was replaced");
     {
         GuestAllocations::Mutation mutation;
         mutation.Protect(block, unit, true, true, [] {});
     }
     read(4, 64);
     read(unit + 4, 64);
-    Require(rejectedImports == 6, "split mapping retained an allocation-wide failure");
+    Require(rejectedImports == (multipleRanges ? 7 : 5), "split mapping retained an allocation-wide failure");
     ClearHostImports(context.device);
     read(4, 64);
-    Require(rejectedImports == 7, "clearing imports retained a transport failure");
+    Require(rejectedImports == (multipleRanges ? 8 : 6), "clearing imports retained a transport failure");
     std::cout << "Import failures preserve allocation boundaries, replacement identities, protection splits and device-cache clearing\n";
+}
+
+void importRangeBenchmark(const Device& device) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    auto context = device.GetContext();
+    context.hostImportAlignment = 4096;
+    context.dmaBufImport = false;
+    sharedImportResolver = context.deviceProc;
+    context.deviceProc = rejectHostImport;
+    ClearHostImports(context.device);
+    constexpr std::size_t unit = 2u << 20u;
+    constexpr std::size_t count = 17;
+    void* memory = AllocateWatched(unit * count, 65536);
+    Require(memory != nullptr, "import range benchmark requires watched memory");
+    {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t i = 0; i < count; ++i) mutation.Add(static_cast<std::byte*>(memory) + i * unit, unit, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        void* memory;
+        ~Cleanup() {
+            ClearHostImports(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                for (std::size_t i = 0; i < count; ++i) mutation.Remove(static_cast<std::byte*>(memory) + i * unit);
+            }
+            ReleaseWatched(memory, unit * count);
+        }
+    } cleanup{context, memory};
+    for (const std::size_t bytes : {std::size_t{256}, std::size_t{16711680}, std::size_t{33423360}}) {
+        std::array<double, 9> times;
+        const auto address = reinterpret_cast<std::uint64_t>(memory) + 0xc0000;
+        for (unsigned pass = 0; pass <= times.size(); ++pass) {
+            const auto started = std::chrono::steady_clock::now();
+            for (unsigned i = 0; i < 65536; ++i) Require(HostImportFor(context, address, bytes) == nullptr, "forced failed import succeeded");
+            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - started).count() / 65536;
+        }
+        std::ranges::sort(times);
+        std::cout << "Failed import range " << bytes << " bytes: median " << times[4] << " ns, p95 pass " << times.back() << " ns\n";
+    }
 }
 
 void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
@@ -4508,6 +4559,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-failed-imports") {
             resourceBuildBenchmark(device, false, true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-import-ranges") {
+            importRangeBenchmark(device);
             return 0;
         }
         std::lock_guard gpu(GpuMutex());
