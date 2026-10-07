@@ -41,7 +41,7 @@ bool DrawPlanCache::Admit(std::uint64_t key) {
     return repeated;
 }
 
-bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants) const {
+bool DrawRecipeRecord::Matches(std::span<const std::shared_ptr<DispatchVariant>> variants) const {
     if (stages.size() != variants.size()) return false;
     for (std::size_t i = 0; i < stages.size(); ++i) {
         if (stages[i].owner_before(variants[i]) || variants[i].owner_before(stages[i])) return false;
@@ -102,28 +102,28 @@ void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
     }
 }
 
-void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawPlan> decode, std::span<const DrawProgram> programs, std::uint64_t shape) {
+void Driver::insertDrawEntry(std::uint64_t key, std::span<DrawStage> work, std::shared_ptr<const DrawPlan> decode, std::span<const DrawProgram> programs, std::uint64_t shape) {
     std::lock_guard cacheLock(drawCacheMutex);
     auto& counters = drawEntryCounters;
     const auto found = drawCache.find(key);
     auto replacement = std::make_shared<DrawEntry>();
-    replacement->stages.resize(fresh.size());
+    replacement->stages.resize(work.size());
     replacement->plan = std::move(decode);
     replacement->programs.assign(programs.begin(), programs.end());
     if (found != drawCache.end()) {
-        if (found->second.entry->stages.size() == fresh.size()) replacement->stages = found->second.entry->stages;
+        if (found->second.entry->stages.size() == work.size()) replacement->stages = found->second.entry->stages;
         replacement->recipes.store(found->second.entry->recipes.load());
     }
-    for (std::size_t i = 0; i < fresh.size(); ++i) {
-        if (fresh[i] == nullptr) continue;
+    for (std::size_t i = 0; i < work.size(); ++i) {
+        if (work[i].fresh == nullptr) continue;
         auto& variants = replacement->stages[i];
-        const auto present = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == fresh[i]->pushOffset && kept->runs == fresh[i]->runs && kept->words == fresh[i]->words; });
+        const auto present = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == work[i].fresh->pushOffset && kept->runs == work[i].fresh->runs && kept->words == work[i].fresh->words; });
         if (present != variants.end()) {
             ++counters.present;
-            fresh[i] = *present;
+            work[i].fresh = *present;
             continue;
         }
-        variants.insert(variants.begin(), fresh[i]);
+        variants.insert(variants.begin(), work[i].fresh);
         ++counters.variantsInserted;
         while (variants.size() > dispatchVariants()) {
             variants.pop_back();
@@ -165,7 +165,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     }
 }
 
-std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages) {
+std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, std::span<const std::shared_ptr<DispatchVariant>> stages) {
     std::shared_ptr<const std::vector<DrawRecipeRecord>> records;
     {
         std::lock_guard cacheLock(drawCacheMutex);
@@ -180,7 +180,7 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     return nullptr;
 }
 
-void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe) {
+void Driver::attachDrawRecipe(std::uint64_t key, std::span<const std::shared_ptr<DispatchVariant>> stages, std::shared_ptr<const DrawRecipe> recipe) {
     std::shared_ptr<DrawEntry> entry;
     {
         std::lock_guard cacheLock(drawCacheMutex);

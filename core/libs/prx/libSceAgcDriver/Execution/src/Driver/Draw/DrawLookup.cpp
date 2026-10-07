@@ -4,7 +4,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, std::span<const DrawProgram> programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, std::span<const DrawProgram> programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, std::span<DrawStage> work, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry) {
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (!registerKey) {
@@ -40,9 +40,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(program.plan->firstUserSgpr);
                 mix(program.UserData().size());
                 for (const auto word : program.UserData()) mix(word);
-                mix(vertexInfos[i].has_value());
-                if (!vertexInfos[i]) continue;
-                const auto& vertex = *vertexInfos[i];
+                mix(work[i].vertexInfo.has_value());
+                if (!work[i].vertexInfo) continue;
+                const auto& vertex = *work[i].vertexInfo;
                 require(vertex.resourcesNum <= vertex.resources.size(), "vertex stage info resource count exceeds its table");
                 mix(vertex.resourcesNum);
                 mix(vertex.fetchAttribReg);
@@ -93,7 +93,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     for (std::size_t rank = 0; rank < variants.size(); ++rank) {
                         const auto& variant = variants[rank];
                         if (variant->pushOffset != cursor) continue;
-                        auto& regions = matchedRegions[i];
+                        auto& regions = work[i].matchedRegions;
                         regions.clear();
                         appendEntryRegions(*variant, regions);
                         ++compared;
@@ -102,13 +102,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal) continue;
-                        matched[i] = variant;
+                        work[i].matched = variant;
                         ranks[i] = rank;
                         ++stageEqual;
                         cursor += static_cast<std::uint32_t>(variant->compiled->pushConstants.size());
                         break;
                     }
-                    if (matched[i] != nullptr) continue;
+                    if (work[i].matched != nullptr) continue;
                     if (!anyLayout) miss = DrawMiss::Layout;
                     else if (outcome != EntryOutcome::Differing) miss = DrawMiss::Gate;
                     else miss = roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
@@ -126,7 +126,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 ++drawCacheHits;
                 bool rotate = false;
                 for (std::size_t i = 0; i < programs.size(); ++i) {
-                    if (matched[i] == nullptr) continue;
+                    if (work[i].matched == nullptr) continue;
                     ++counters.variantHitsByRank[ranks[i]];
                     if (ranks[i] != 0) rotate = true;
                 }
@@ -143,7 +143,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             if (ranks[i] == 0) continue;
                             auto& variants = rotated->stages[i];
                             variants.erase(variants.begin() + static_cast<std::ptrdiff_t>(ranks[i]));
-                            variants.insert(variants.begin(), matched[i]);
+                            variants.insert(variants.begin(), work[i].matched);
                         }
                         again->second.entry = std::move(rotated);
                     }
@@ -176,7 +176,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::optional<SampledReadScope> sampling;
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack || !std::ranges::equal(programs[i].UserData(), dataEntry->programs[i].UserData())) continue;
-                auto& candidates = dataCandidates[i];
+                auto& candidates = work[i].candidates;
                 for (const auto& variant : dataEntry->stages[i]) {
                     if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;

@@ -143,6 +143,38 @@ void testPlanLifetime() {
     check(workload.Size() == 352, "shape storage grew with unique runtime inputs");
 }
 
+void testStageLifetime() {
+    DrawRecipeRecord recipe;
+    std::array<std::shared_ptr<DispatchVariant>, MaxDrawPrograms> retained;
+    {
+        std::array<DrawStage, MaxDrawPrograms> outer;
+        for (std::size_t i = 0; i < outer.size(); ++i) {
+            outer[i].fresh = std::make_shared<DispatchVariant>();
+            outer[i].fresh->pushOffset = i * 4;
+            outer[i].vertexInfo.emplace().resourcesNum = i + 1;
+            retained[i] = outer[i].fresh;
+            recipe.stages.push_back(outer[i].fresh);
+        }
+        {
+            std::array<DrawStage, MaxDrawPrograms> retry;
+            for (auto& stage : retry) {
+                stage.fresh = std::make_shared<DispatchVariant>();
+                stage.vertexInfo.emplace().resourcesNum = 31;
+            }
+            for (std::size_t i = 0; i < outer.size(); ++i) {
+                check(outer[i].fresh == retained[i] && outer[i].vertexInfo->resourcesNum == i + 1, "nested draw replaced an outer draw's working set");
+            }
+        }
+    }
+    check(recipe.Matches(retained) && !recipe.Expired(), "retained stage variants died with the draw working set");
+    check(!recipe.Matches(std::span(retained).first(MaxDrawPrograms - 1)), "recipe accepted a truncated stage list");
+    std::swap(retained.front(), retained.back());
+    check(!recipe.Matches(retained), "recipe accepted reordered stage ownership");
+    std::swap(retained.front(), retained.back());
+    retained[1].reset();
+    check(recipe.Expired() && !recipe.Matches(retained), "released variant remained valid in a recipe");
+}
+
 DrawRegisterStateKey legacyRegisterStateKey(const QueueState& queue, bool allUserWords = false) {
     std::uint64_t key = 0xcbf29ce484222325ull;
     std::uint64_t shapeKey = 0xcbf29ce484222325ull;
@@ -388,6 +420,7 @@ int main(int argc, char** argv) {
         testInputs();
         testMergedInputs();
         testPlanLifetime();
+        testStageLifetime();
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark") benchmark();
         std::puts("Draw plan inputs, ownership, eviction and admission passed");
         return 0;

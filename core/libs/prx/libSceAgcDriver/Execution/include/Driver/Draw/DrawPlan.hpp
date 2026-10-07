@@ -12,6 +12,8 @@ namespace AgcDriver::Graphics { class VertexStagePlan; }
 
 namespace AgcDriver::DriverDetail {
 
+inline constexpr std::size_t MaxDrawPrograms = 5;
+
 struct DrawProgramPlan {
     ShaderRecompiler::ShaderBinary binary;
     std::uint32_t userDataBase;

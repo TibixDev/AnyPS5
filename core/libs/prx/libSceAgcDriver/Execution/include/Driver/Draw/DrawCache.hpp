@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPlan.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -19,7 +20,7 @@ namespace AgcDriver::DriverDetail {
 struct DrawRecipeRecord {
     std::vector<std::weak_ptr<const DispatchVariant>> stages;
     std::shared_ptr<const DrawRecipe> recipe;
-    bool Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants) const;
+    bool Matches(std::span<const std::shared_ptr<DispatchVariant>> variants) const;
     bool Expired() const;
 };
 
@@ -63,8 +64,6 @@ private:
     std::vector<Seen> seen;
 };
 
-using DrawDataCandidates = std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>>;
-
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
 struct DrawEntryCounters {
@@ -89,6 +88,21 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+};
+
+struct DrawStage {
+    std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+    std::vector<Graphics::DecodeRead> decodeReads;
+    StageCapture capture;
+    std::shared_ptr<DispatchVariant> matched;
+    std::vector<ShaderRecompiler::MemoryRegion> matchedRegions;
+    std::shared_ptr<DispatchVariant> fresh;
+    std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>> candidates;
+    const ShaderRecompiler::RecompileResult* result = nullptr;
+    std::uint32_t pushOffset = 0;
+    std::size_t compiledIndex = 0;
+    bool recompiled = false;
+    bool reused = false;
 };
 
 }
