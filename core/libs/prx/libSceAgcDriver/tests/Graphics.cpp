@@ -759,6 +759,47 @@ void metadataPassTests() {
     }
 }
 
+void depthClearPassTests() {
+    using namespace AgcDriver::Graphics;
+    auto queue = makeState();
+    queue.context[0x000] = 0;
+    Require(!DecodeDepthClearPass(queue), "ordinary draw was decoded as a depth clear");
+    queue.context[0x000] = 3;
+    queue.context[0x002] = 0;
+    queue.context[0x200] = 0x777;
+    queue.context[0x8e] = 0;
+    queue.context[0x010] = 0x80000183;
+    queue.context[0x011] = 0x20000181;
+    queue.context[0x012] = queue.context[0x014] = 0x100;
+    queue.context[0x013] = queue.context[0x015] = 0x200;
+    queue.context[0x007] = (3u << 16u) | 63u;
+    queue.context[0x00a] = 37;
+    queue.context[0x00b] = std::bit_cast<std::uint32_t>(0.75f);
+    queue.context[0x10b] = 0x333;
+    queue.context[0x10c] = queue.context[0x10d] = 0xffffffff;
+    const auto pass = DecodeDepthClearPass(queue);
+    Require(pass && pass->aspects == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) && pass->target.clearDepth == 0.75f && pass->target.clearStencil == 37, "explicit depth/stencil clear lost its aspects or values");
+    Require(!queue.context.contains(0x1b3), "clear test accidentally supplies pixel inputs");
+    auto invalid = queue;
+    invalid.context[0x8e] = 0xf;
+    expectFailure([&] { DecodeDepthClearPass(invalid); }, "color writes");
+    invalid = queue;
+    invalid.context[0x91] = 0x40020;
+    expectFailure([&] { DecodeDepthClearPass(invalid); }, "part of a surface");
+    invalid = queue;
+    invalid.context[0x2] = 1u << 24u;
+    expectFailure([&] { DecodeDepthClearPass(invalid); }, "writable enabled depth plane");
+    invalid = queue;
+    invalid.context[0x2] = 1u << 13u;
+    expectFailure([&] { DecodeDepthClearPass(invalid); }, "multiple slices");
+    queue.context[0x000] = 1;
+    queue.context[0x200] = 0x76;
+    Require(DecodeDepthClearPass(queue)->aspects == VK_IMAGE_ASPECT_DEPTH_BIT, "depth-only clear included stencil");
+    queue.context[0x000] = 2;
+    queue.context[0x200] = 0x701;
+    Require(DecodeDepthClearPass(queue)->aspects == VK_IMAGE_ASPECT_STENCIL_BIT, "stencil-only clear included depth");
+}
+
 void cmaskPassTests() {
     using namespace AgcDriver::Graphics;
     Require(CmaskKeyBytes(3840, 2160) == 81920 && CmaskKeyBytes(1024, 512) == 4096 && CmaskKeyBytes(1025, 513) == 16384, "CMASK macroblock extent changed");
@@ -2114,6 +2155,7 @@ int main() {
         CompactedExportTests();
         metadataPassTests();
         cmaskPassTests();
+        depthClearPassTests();
         ShaderStageTests();
         PixelInputLayoutTests();
         InitialContextTests();

@@ -141,8 +141,8 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
     return face;
 }
 
-void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result) {
-    zero(cx, 0x000, 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
+void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result, bool clearing = false) {
+    zero(cx, 0x000, clearing ? 0x00001f9cu : 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
     zero(cx, 0x010, 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
@@ -746,6 +746,52 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
         pass.targets.push_back(target);
     }
     return pass;
+}
+
+std::optional<DepthClearPass> DecodeDepthClearPass(const QueueState& queue) {
+    const auto& cx = queue.context;
+    const auto control = find(cx, 0x000);
+    if (control == cx.end() || (control->second & 3u) == 0) return std::nullopt;
+    Require((control->second & ~0x2063u) == 0, "depth clear with copy, resummarize or decompress is unsupported");
+    Require(ColorWriteMask(cx) == 0, "depth clear with color writes is unsupported");
+    zero(cx, 0x1c4, ~0u, "depth clear with shader depth or sample-mask export");
+    zero(cx, 0x2f8, ~0u, "depth clear with multisampling or coverage conversion");
+    zero(cx, 0x080, ~0u, "depth clear with a window offset");
+    const auto view = read(cx, 0x002);
+    const auto lastSlice = ((view >> 13u) & 0x7ffu) | ((view >> 19u) & 0x1800u);
+    Require((view & 0x1fffu) == lastSlice, "depth clear over multiple slices is unsupported");
+    const auto depthControl = read(cx, 0x200);
+    Require((depthControl & 8u) == 0, "depth clear with depth bounds is unsupported");
+    Require((control->second & 1u) != 0 || (depthControl & 6u) == 0, "stencil clear with ordinary depth work is unsupported");
+    Require((control->second & 2u) != 0 || (depthControl & 1u) == 0, "depth clear with ordinary stencil work is unsupported");
+    VkImageAspectFlags aspects = 0;
+    if ((control->second & 1u) != 0) {
+        Require((depthControl & 6u) == 6u && (view & 0x01000000u) == 0 && (read(cx, 0x010) & 3u) != 0, "depth clear needs a writable enabled depth plane");
+        aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    }
+    if ((control->second & 2u) != 0) {
+        Require((depthControl & 1u) != 0 && (view & 0x02000000u) == 0 && (read(cx, 0x011) & 1u) != 0, "stencil clear needs a writable enabled stencil plane");
+        aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    }
+    State decoded{};
+    decodeDepth(cx, depthControl, decoded, true);
+    const auto& target = *decoded.depth;
+    if ((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) Require(std::isfinite(target.clearDepth) && target.clearDepth >= 0.0f && target.clearDepth <= 1.0f, "depth clear value is outside [0, 1]");
+    Require(read(cx, 0x206) == 0x43fu, "unsupported viewport transform for depth clear");
+    const auto xs = std::fabs(readFloat(cx, 0x10f));
+    const auto xo = readFloat(cx, 0x110);
+    const auto ys = std::fabs(readFloat(cx, 0x111));
+    const auto yo = readFloat(cx, 0x112);
+    Require(std::isfinite(xs) && std::isfinite(xo) && std::isfinite(ys) && std::isfinite(yo), "non-finite depth clear viewport");
+    VkRect2D covered{{0, 0}, {0x7fffu, 0x7fffu}};
+    intersect(covered, cx, 0x00c, true);
+    intersect(covered, cx, 0x081, false);
+    intersect(covered, cx, 0x090, false);
+    if ((read(cx, 0x292) & 2u) != 0) intersect(covered, cx, 0x094, false);
+    const bool viewportCovers = xo - xs <= 0.0f && xo + xs >= target.extent.width && yo - ys <= 0.0f && yo + ys >= target.extent.height;
+    const bool scissorCovers = covered.offset.x == 0 && covered.offset.y == 0 && covered.extent.width >= target.extent.width && covered.extent.height >= target.extent.height;
+    Require(viewportCovers && scissorCovers, "depth clear over part of a surface is unsupported");
+    return DepthClearPass{target, aspects};
 }
 
 std::string DrawRejection(const QueueState& queue, bool indexed) {
