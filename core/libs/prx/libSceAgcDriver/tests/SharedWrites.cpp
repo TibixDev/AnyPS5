@@ -196,7 +196,7 @@ void smallStores() {
     require(StoreOwnBytes(0, std::span<const std::byte>{}) == 0, "empty store produced a version");
 }
 
-template<class F> void fails(F&& fn) {
+template<class TAction> void fails(TAction&& fn) {
     bool failed = false;
     try { fn(); } catch (const std::runtime_error&) { failed = true; }
     require(failed, "invalid write was accepted");
@@ -238,7 +238,7 @@ void run() {
         };
         require(collect(), "guest mapping is no longer watched");
         dirty = 0;
-        require(GuestArena::GuestArenaWriteSharedBacking_nid_postfix(mapping.Address(), source.data(), source.size()), "shared writer rejected direct backing");
+        require(GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(mapping.Address(), source.data(), source.size()), "shared writer rejected direct backing");
         require(collect() && dirty == 0, "host write dirtied the tracked guest mapping");
         bytes[part * 4] = std::byte{31};
         require(collect() && dirty == 4096, "guest write tracking was disarmed");
@@ -267,7 +267,7 @@ void run() {
         require(sceKernelMunmap(middle, part) == 0, "partial unmap failed");
         const auto saved = bytes[0];
         across[0] = std::byte{99};
-        require(!GuestArena::GuestArenaWriteSharedBacking_nid_postfix(mapping.Address(), across.data(), across.size()), "writer accepted an unmapped gap");
+        require(!GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(mapping.Address(), across.data(), across.size()), "writer accepted an unmapped gap");
         require(bytes[0] == saved, "failed shared write changed its prefix");
 #endif
         require(sceKernelMapDirectMemory(&middle, part, 3, 0x10, mapping.physical + part, part) == 0, "original backing restore failed");

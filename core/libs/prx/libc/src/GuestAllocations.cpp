@@ -112,7 +112,7 @@ std::uint64_t GuestAllocationsGeneration_nid_postfix() {
     return generation.load(std::memory_order_acquire);
 }
 
-std::uint64_t GuestAllocationsValidateMapping_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint64_t since) {
+std::uint64_t GuestAllocationsValidateMapping_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t since) {
     if (since == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return 0;
     auto current = generation.load(std::memory_order_acquire);
     if (since == current) return current;
@@ -477,7 +477,7 @@ Lease GuestAllocationsAcquire_nid_postfix() {
     return result;
 }
 
-Lease GuestAllocationsAcquireRange_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+Lease GuestAllocationsAcquireRange_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return {};
     std::lock_guard lock(registry().mutex);
     const auto& ranges = registry().ranges;
@@ -488,7 +488,7 @@ Lease GuestAllocationsAcquireRange_nid_postfix(std::uintptr_t address, std::size
     return {range};
 }
 
-Range GuestAllocationsTryDescribeRange_nid_postfix(std::uintptr_t address) {
+Range GuestAllocationsTryDescribeRange_nid_no_patch(std::uintptr_t address) {
     std::unique_lock lock(registry().mutex, std::try_to_lock);
     if (!lock.owns_lock()) return {};
     const auto& ranges = registry().ranges;
@@ -498,7 +498,7 @@ Range GuestAllocationsTryDescribeRange_nid_postfix(std::uintptr_t address) {
     return address - range.address < range.bytes ? range : Range{};
 }
 
-Lease GuestAllocationsAcquireSpan_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+Lease GuestAllocationsAcquireSpan_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return {};
     std::lock_guard lock(registry().mutex);
     const auto& ranges = registry().ranges;

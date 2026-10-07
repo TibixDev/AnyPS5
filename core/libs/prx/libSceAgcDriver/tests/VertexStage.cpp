@@ -27,7 +27,7 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
-template<class F> void fails(F&& action) {
+template<class TAction> void fails(TAction&& action) {
     try { action(); } catch (const std::runtime_error&) { return; }
     throw std::runtime_error("invalid vertex table was accepted");
 }

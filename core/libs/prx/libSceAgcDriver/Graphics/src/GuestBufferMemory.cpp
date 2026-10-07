@@ -267,7 +267,7 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
         std::vector<GuestArena::SharedBackingSlice> slices;
         ~Backings() { for (const auto& slice : slices) close(slice.file); }
     } backings;
-    if (step != nullptr && context.dmaBufImport && GuestArena::GuestArenaSharedBackings_nid_postfix(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), backings.slices)) step = createDmaBufImport(context, entry, backings.slices, failure);
+    if (step != nullptr && context.dmaBufImport && GuestArena::GuestArenaSharedBackings_nid_no_patch(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), backings.slices)) step = createDmaBufImport(context, entry, backings.slices, failure);
 #endif
     return step;
 }
@@ -527,7 +527,7 @@ void refreshImports(const Context& context, HostImports& state) {
         return std::all_of(owners.begin(), owners.end(), [&](const auto& weak) {
             const auto owner = weak.lock();
             if (owner == nullptr) return false;
-            if (GuestAllocations::GuestAllocationsValidateMapping_nid_postfix(owner->address, owner->bytes, state.refreshedGeneration) != 0) return true;
+            if (GuestAllocations::GuestAllocationsValidateMapping_nid_no_patch(owner->address, owner->bytes, state.refreshedGeneration) != 0) return true;
             return leasedRangeAt(currentRanges(), owner->address) == owner.get();
         });
     };
@@ -1361,7 +1361,7 @@ std::shared_ptr<HostImport> HostImportFor(const Context& context, std::uint64_t 
     if (const auto entry = findImport(state, address, address + bytes)) return entry;
     if (knownImportFailure(context, state, address, address + bytes)) return nullptr;
     const auto [first, last] = importBounds(context, address, address + bytes);
-    const auto lease = first < last ? GuestAllocations::GuestAllocationsAcquireSpan_nid_postfix(first, last - first) : GuestAllocations::Lease{};
+    const auto lease = first < last ? GuestAllocations::GuestAllocationsAcquireSpan_nid_no_patch(first, last - first) : GuestAllocations::Lease{};
     if (importsStale(context, state)) refreshImports(context, state);
     return importRange(context, state, address, address + bytes, lease);
 }
@@ -1382,7 +1382,7 @@ void ClearHostImports(VkDevice device) {
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
-    return !GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(address, bytes).empty();
+    return !GuestAllocations::GuestAllocationsAcquireRange_nid_no_patch(address, bytes).empty();
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
@@ -2224,7 +2224,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 const bool haveLease = !lease.empty() || space != nullptr;
                 if (!haveLease) {
                     const auto [first, last] = importBounds(context, region.begin, region.end);
-                    if (first < last) targeted = GuestAllocations::GuestAllocationsAcquireSpan_nid_postfix(first, last - first);
+                    if (first < last) targeted = GuestAllocations::GuestAllocationsAcquireSpan_nid_no_patch(first, last - first);
                 }
                 const auto& available = !lease.empty() ? lease : space != nullptr ? space->lease : targeted;
                 if (importsStale(context, state)) refreshImports(context, state);

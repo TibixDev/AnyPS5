@@ -7,7 +7,7 @@
 #include <string>
 
 #include "prx/libc/include/General.hpp"
-#include "Ngs2Internal.hpp"
+#include "prx/libSceNgs2.native/include/Ngs2Types.hpp"
 
 static constexpr std::uint32_t PAN_FORMAT_MONO = 1;
 static constexpr std::uint32_t PAN_FORMAT_STEREO = 2;
@@ -63,44 +63,42 @@ static void PanAround(const float* degrees, std::uint32_t numSpeakers, float ang
     gains[order[0]] = 1.0f;
 }
 
-#pragma GCC visibility push(default)
-
 extern "C" {
 
-int APS5_VABI sceNgs2PanInit(Ngs2PanWork* work, const float* speaker_angles, float unit_angle, uint32_t num_speakers) {
-    if (work == nullptr || num_speakers == 0 || num_speakers > MAX_PAN_SPEAKERS || !std::isfinite(unit_angle) || unit_angle <= 0.0f) APS5_INVALID_ARG_EX;
-    if (speaker_angles == nullptr && num_speakers > 2) {
-        throw std::runtime_error("NGS2: default speaker angles for " + std::to_string(num_speakers) + " speakers are not implemented");
+int APS5_VABI sceNgs2PanInit(Ngs2PanWork* work, const float* speakerAngles, float unitAngle, uint32_t numSpeakers) {
+    if (work == nullptr || numSpeakers == 0 || numSpeakers > MAX_PAN_SPEAKERS || !std::isfinite(unitAngle) || unitAngle <= 0.0f) APS5_INVALID_ARG_EX;
+    if (speakerAngles == nullptr && numSpeakers > 2) {
+        throw std::runtime_error("NGS2: default speaker angles for " + std::to_string(numSpeakers) + " speakers are not implemented");
     }
-    if (speaker_angles != nullptr && !std::all_of(speaker_angles, speaker_angles + num_speakers, [](float angle) { return std::isfinite(angle); })) APS5_INVALID_ARG_EX;
+    if (speakerAngles != nullptr && !std::all_of(speakerAngles, speakerAngles + numSpeakers, [](float angle) { return std::isfinite(angle); })) APS5_INVALID_ARG_EX;
     Ngs2PanWork initialized{};
-    for (std::uint32_t i = 0; i < num_speakers; i++) {
-        if (speaker_angles != nullptr) initialized.speaker_angles[i] = speaker_angles[i];
-        else if (num_speakers == 2) initialized.speaker_angles[i] = (i == 0 ? -0.25f : 0.25f) * unit_angle;
+    for (std::uint32_t i = 0; i < numSpeakers; i++) {
+        if (speakerAngles != nullptr) initialized.speaker_angles[i] = speakerAngles[i];
+        else if (numSpeakers == 2) initialized.speaker_angles[i] = (i == 0 ? -0.25f : 0.25f) * unitAngle;
     }
-    initialized.unit_angle = unit_angle;
-    initialized.num_speakers = num_speakers;
+    initialized.unit_angle = unitAngle;
+    initialized.num_speakers = numSpeakers;
     *work = initialized;
     return SCE_NGS2_OK;
 }
 
-int APS5_VABI sceNgs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* params, uint32_t num_params, uint32_t matrix_format, float* out_volume_matrix) {
-    if (out_volume_matrix == nullptr) return SCE_NGS2_ERROR_INVALID_OUT_ADDRESS;
-    if (num_params == 0) return SCE_NGS2_OK;
+int APS5_VABI sceNgs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* params, uint32_t numParams, uint32_t matrixFormat, float* outVolumeMatrix) {
+    if (outVolumeMatrix == nullptr) return SCE_NGS2_ERROR_INVALID_OUT_ADDRESS;
+    if (numParams == 0) return SCE_NGS2_OK;
     if (work == nullptr || params == nullptr) APS5_INVALID_ARG_EX;
     const auto numSpeakers = work->num_speakers;
     if (numSpeakers == 0 || numSpeakers > MAX_PAN_SPEAKERS || !std::isfinite(work->unit_angle) || work->unit_angle <= 0.0f) APS5_INVALID_ARG_EX;
     if (!std::all_of(work->speaker_angles, work->speaker_angles + numSpeakers, [](float angle) { return std::isfinite(angle); })) APS5_INVALID_ARG_EX;
-    if (matrix_format != PAN_FORMAT_MONO && matrix_format != PAN_FORMAT_STEREO && !HasLfe(matrix_format)) {
-        throw std::runtime_error("NGS2: pan matrix format " + std::to_string(matrix_format) + " is not implemented");
+    if (matrixFormat != PAN_FORMAT_MONO && matrixFormat != PAN_FORMAT_STEREO && !HasLfe(matrixFormat)) {
+        throw std::runtime_error("NGS2: pan matrix format " + std::to_string(matrixFormat) + " is not implemented");
     }
-    const bool hasLfe = HasLfe(matrix_format);
-    if (numSpeakers != (hasLfe ? matrix_format - 1 : matrix_format)) {
-        throw std::runtime_error("NGS2: panning " + std::to_string(numSpeakers) + " speakers into matrix format " + std::to_string(matrix_format) + " is not implemented");
+    const bool hasLfe = HasLfe(matrixFormat);
+    if (numSpeakers != (hasLfe ? matrixFormat - 1 : matrixFormat)) {
+        throw std::runtime_error("NGS2: panning " + std::to_string(numSpeakers) + " speakers into matrix format " + std::to_string(matrixFormat) + " is not implemented");
     }
     float degrees[MAX_PAN_SPEAKERS];
     for (std::uint32_t i = 0; i < numSpeakers; i++) degrees[i] = WrapDegrees(work->speaker_angles[i], work->unit_angle);
-    for (std::uint32_t p = 0; p < num_params; p++) {
+    for (std::uint32_t p = 0; p < numParams; p++) {
         const auto& param = params[p];
         if (!std::isfinite(param.angle) || !std::isfinite(param.distance) || !std::isfinite(param.fbw_level) || !std::isfinite(param.lfe_level)) APS5_INVALID_ARG_EX;
         if (param.distance < 0.0f || param.distance > 1.0f) throw std::runtime_error("NGS2: pan distances outside the unit circle are not implemented");
@@ -114,7 +112,7 @@ int APS5_VABI sceNgs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* p
             for (std::uint32_t i = 0; i < numSpeakers; ++i)
                 gains[i] = std::sqrt(diffusePower + param.distance * gains[i] * gains[i]);
         }
-        float* row = out_volume_matrix + static_cast<std::size_t>(p) * matrix_format;
+        float* row = outVolumeMatrix + static_cast<std::size_t>(p) * matrixFormat;
         for (std::uint32_t i = 0; i < numSpeakers; i++) {
             const auto channel = hasLfe && i >= LFE_CHANNEL ? i + 1 : i;
             row[channel] = gains[i] * param.fbw_level;
@@ -125,5 +123,3 @@ int APS5_VABI sceNgs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* p
 }
 
 }
-
-#pragma GCC visibility pop

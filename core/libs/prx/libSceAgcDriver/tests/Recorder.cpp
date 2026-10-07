@@ -1682,7 +1682,7 @@ public:
         update(context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")) {
         Require(active == nullptr, "nested descriptor update capture");
         if (previous != nullptr) functions = *previous;
-        functions.updateDescriptorSets = Update;
+        functions.updateDescriptorSets = captureUpdate;
         context.functions = &functions;
         active = this;
     }
@@ -1691,7 +1691,7 @@ public:
     std::uint32_t copies = 0;
 
 private:
-    static VKAPI_ATTR void VKAPI_CALL Update(VkDevice device, std::uint32_t count, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
+    static VKAPI_ATTR void VKAPI_CALL captureUpdate(VkDevice device, std::uint32_t count, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
         Contents contents;
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto& write = writes[i];
@@ -4229,7 +4229,7 @@ public:
         uploadImage(context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")) {
         Require(active == nullptr, "nested depth operation counters");
         active = this;
-        context.deviceProc = Resolve;
+        context.deviceProc = resolve;
     }
     ~DepthOperations() {
         context.deviceProc = resolver;
@@ -4240,22 +4240,22 @@ public:
     std::size_t uploads = 0;
 
 private:
-    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Resolve(VkDevice device, const char* name) {
-        if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(CreateImage);
-        if (std::strcmp(name, "vkCmdCopyImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(CopyImage);
-        if (std::strcmp(name, "vkCmdCopyBufferToImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(UploadImage);
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* name) {
+        if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(captureCreateImage);
+        if (std::strcmp(name, "vkCmdCopyImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(captureCopyImage);
+        if (std::strcmp(name, "vkCmdCopyBufferToImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(captureUploadImage);
         return active->resolver(device, name);
     }
-    static VKAPI_ATTR VkResult VKAPI_CALL CreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
+    static VKAPI_ATTR VkResult VKAPI_CALL captureCreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
         const auto result = active->createImage(device, info, allocator, image);
         if (result == VK_SUCCESS) ++active->images;
         return result;
     }
-    static VKAPI_ATTR void VKAPI_CALL CopyImage(VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, std::uint32_t count, const VkImageCopy* regions) {
+    static VKAPI_ATTR void VKAPI_CALL captureCopyImage(VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, std::uint32_t count, const VkImageCopy* regions) {
         active->copies += count;
         active->copyImage(commands, source, sourceLayout, destination, destinationLayout, count, regions);
     }
-    static VKAPI_ATTR void VKAPI_CALL UploadImage(VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    static VKAPI_ATTR void VKAPI_CALL captureUploadImage(VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
         active->uploads += count;
         active->uploadImage(commands, source, destination, layout, count, regions);
     }

@@ -10,7 +10,7 @@ using namespace ShaderRecompiler;
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
-template<class F> void rejects(F&& function) {
+template<class TAction> void rejects(TAction&& function) {
     bool failed = false;
     try { function(); } catch (const std::exception&) { failed = true; }
     require(failed, "invalid binding input was accepted");

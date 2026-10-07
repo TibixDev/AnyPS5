@@ -282,18 +282,18 @@ void GuestArenaSetSharedBacking_nid_postfix(SharedBackingResolver resolver) {
     sharedBackingResolver.store(resolver, std::memory_order_release);
 }
 
-void GuestArenaSetSharedBackingWriter_nid_postfix(SharedBackingWriter writer) {
+void GuestArenaSetSharedBackingWriter_nid_no_patch(SharedBackingWriter writer) {
     sharedBackingWriter.store(writer, std::memory_order_release);
 }
 
-bool GuestArenaWriteSharedBacking_nid_postfix(std::uintptr_t address, const void* source, std::size_t bytes) {
+bool GuestArenaWriteSharedBacking_nid_no_patch(std::uintptr_t address, const void* source, std::size_t bytes) {
     const auto writer = sharedBackingWriter.load(std::memory_order_acquire);
     return writer != nullptr && writer(address, source, bytes);
 }
 
 bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset) {
     std::vector<SharedBackingSlice> slices;
-    if (!GuestArenaSharedBackings_nid_postfix(address, bytes, slices)) return false;
+    if (!GuestArenaSharedBackings_nid_no_patch(address, bytes, slices)) return false;
     if (slices.size() != 1) {
         for (const auto& slice : slices) close(slice.file);
         return false;
@@ -303,7 +303,7 @@ bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t byt
     return true;
 }
 
-bool GuestArenaSharedBackings_nid_postfix(std::uintptr_t address, std::size_t bytes, std::vector<SharedBackingSlice>& slices) {
+bool GuestArenaSharedBackings_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::vector<SharedBackingSlice>& slices) {
     if (!slices.empty()) throw std::invalid_argument("shared backing result is not empty");
     const auto resolver = sharedBackingResolver.load(std::memory_order_acquire);
     return resolver != nullptr && resolver(address, bytes, slices);

@@ -9,18 +9,18 @@
 
 namespace AgcDriver {
 
-template<std::size_t Size>
+template<std::size_t TSize>
 class ShaderReadMask {
 public:
     void Set(std::size_t index) {
-        if (index >= Size) throw std::out_of_range("shader read mask index");
+        if (index >= TSize) throw std::out_of_range("shader read mask index");
         words[index / 64] |= std::uint64_t{1} << (index % 64);
     }
 
     void Reset() { words.fill(0); }
 
-    template<typename Visitor>
-    void ForEachRun(Visitor&& visit) const {
+    template<typename TVisitor>
+    void ForEachRun(TVisitor&& visit) const {
         std::size_t first = 0, end = 0;
         for (std::size_t block = 0; block < words.size(); ++block) {
             auto bits = words[block];
@@ -40,7 +40,7 @@ public:
     }
 
 private:
-    std::array<std::uint64_t, (Size + 63) / 64> words{};
+    std::array<std::uint64_t, (TSize + 63) / 64> words{};
 };
 
 }
