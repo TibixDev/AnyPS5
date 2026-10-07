@@ -780,20 +780,27 @@ Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writ
     require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
     const TimedAccess timed(CounterVerify, bytes);
     Commitment result;
+    result.whole = true;
+    std::pair<std::uint64_t, std::uint64_t> pending{};
     const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes, [&](const PageRun& run) {
         if (run.readable && (!writable || run.writable)) {
-            if (!result.ranges.empty() && result.ranges.back().second == run.begin) result.ranges.back().second = run.end;
-            else result.ranges.emplace_back(run.begin, run.end);
-        }
+            if (pending.second == run.begin) pending.second = run.end;
+            else {
+                if (pending.first != pending.second) result.partialRanges.push_back(pending);
+                pending = {run.begin, run.end};
+            }
+        } else result.whole = false;
         return true;
     });
     require(queried, "cannot query guest memory");
-    result.whole = bytes == 0 || (result.ranges.size() == 1 && result.ranges.front().first == address && result.ranges.front().second == address + bytes);
+    if (!result.whole && pending.first != pending.second) result.partialRanges.push_back(pending);
     return result;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CommittedRanges(std::uint64_t address, std::size_t bytes, bool writable) {
-    return DescribeCommitted(address, bytes, writable).ranges;
+    auto committed = DescribeCommitted(address, bytes, writable);
+    if (committed.whole && bytes != 0) return {{address, address + bytes}};
+    return std::move(committed.partialRanges);
 }
 
 namespace {
