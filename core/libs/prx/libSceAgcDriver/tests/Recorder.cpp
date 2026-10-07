@@ -2174,7 +2174,7 @@ void resourceBuildBenchmark(const Device& device, bool shaderData = false, bool 
     constexpr std::size_t bytes = 16 * 65536;
     void* memory = AllocateWatched(bytes, 65536);
     Require(memory != nullptr, "resource benchmark requires watched memory");
-    if (failedImports) {
+    {
         GuestAllocations::Mutation mutation;
         mutation.Add(memory, bytes, true, true);
     }
@@ -2182,18 +2182,17 @@ void resourceBuildBenchmark(const Device& device, bool shaderData = false, bool 
         Context& context;
         Recorder& recorder;
         void* memory;
-        bool registered;
         ~Cleanup() {
             recorder.Sync();
             ClearCachedTextures(context.device);
-            if (registered) {
-                ClearHostImports(context.device);
+            ClearHostImports(context.device);
+            {
                 GuestAllocations::Mutation mutation;
                 mutation.Remove(memory);
             }
             ReleaseWatched(memory, bytes);
         }
-    } cleanup{context, recorder, memory, failedImports};
+    } cleanup{context, recorder, memory};
     std::memset(memory, 0x71, bytes);
     const auto address = reinterpret_cast<std::uint64_t>(memory);
     for (const std::uint32_t inputBytes : {256u, 16384u}) {
