@@ -14,16 +14,19 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
 #include <map>
 #include <future>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -188,7 +191,86 @@ void verifyPureFlatSlots() {
 
 // A compute program sampling a T# loaded from a table buffer at a runtime key (a bindless image
 // table): mode M enumerates the keys from the material records, mode T binds the whole table.
-void verifyBindlessTable() {
+template<std::size_t Size>
+void verifyReadMask() {
+    std::mt19937_64 random(Size);
+    for (unsigned trial = 0; trial < 2048; ++trial) {
+        AgcDriver::ShaderReadMask<Size> mask;
+        std::array<bool, Size> bits{};
+        for (std::size_t i = 0; i < Size; ++i) {
+            bits[i] = trial == 0 ? false : trial == 1 ? true : trial == 2 ? i % 2 != 0 : trial == 3 ? i % 64 == 0 || i % 64 == 63 : random() % (1 + trial % 17) == 0;
+            if (bits[i]) mask.Set(i);
+        }
+        std::vector<std::pair<std::size_t, std::size_t>> expected, actual;
+        for (std::size_t i = 0; i < Size;) {
+            if (!bits[i]) { ++i; continue; }
+            const auto begin = i;
+            while (i < Size && bits[i]) ++i;
+            expected.emplace_back(begin, i - begin);
+        }
+        const auto collect = [&](std::size_t first, std::size_t count) { actual.emplace_back(first, count); };
+        mask.ForEachRun(collect);
+        require(actual == expected, "packed shader read ranges differ from the word reference");
+        actual.clear();
+        mask.ForEachRun(collect);
+        require(actual == expected, "enumerating shader read ranges changed the mask");
+        mask.Reset();
+        actual.clear();
+        mask.ForEachRun(collect);
+        require(actual.empty(), "reset shader read mask retained a range");
+        bool rejected = false;
+        try { mask.Set(Size); } catch (const std::out_of_range&) { rejected = true; }
+        require(rejected, "shader read mask accepted an out-of-range word");
+    }
+}
+
+void captureBenchmark(const ShaderRecompiler::RecompileRequest& request) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    const auto source = ShaderRecompiler::ResolveSource(request);
+    AgcDriver::ShaderMemory reference({});
+    const auto expected = reference.Capture(request, source.get());
+    const auto ranges = reference.Regions();
+    require(!ranges.empty(), "capture benchmark did not read guest memory");
+    const auto validate = [&](const auto& actual) {
+        require(actual.size() == ranges.size(), "capture benchmark changed the observed ranges");
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            require(actual[i].guestAddress == ranges[i].guestAddress && std::ranges::equal(actual[i].bytes, ranges[i].bytes), "capture benchmark changed observed bytes");
+        }
+    };
+    validate(reference.TakeRecentRegions());
+    require(reference.TakeRecentRegions().empty(), "capture benchmark retained recent reads");
+    for (unsigned stages : {1u, 2u}) {
+        AgcDriver::ShaderMemory check({});
+        for (unsigned stage = 0; stage < stages; ++stage) {
+            const auto actual = check.Capture(request, source.get());
+            const auto& left = actual->snapshot;
+            const auto& right = expected->snapshot;
+            require(left.buffers == right.buffers && left.images == right.images && left.samplers == right.samplers && left.flattenedSrt == right.flattenedSrt && left.userData == right.userData && left.uniformFill == right.uniformFill, "capture benchmark changed resource contents");
+            validate(check.TakeRecentRegions());
+            validate(check.Regions());
+        }
+        std::array<double, 9> times;
+        std::uint64_t checksum = 0;
+        for (unsigned pass = 0; pass <= times.size(); ++pass) {
+            const auto started = std::chrono::steady_clock::now();
+            for (unsigned i = 0; i < 4096; ++i) {
+                AgcDriver::ShaderMemory memory({});
+                for (unsigned stage = 0; stage < stages; ++stage) {
+                    const auto capture = memory.Capture(request, source.get());
+                    checksum += capture->snapshot.flattenedSrt.size();
+                    checksum += memory.TakeRecentRegions().size();
+                }
+                checksum += memory.Regions().size();
+            }
+            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / 4096;
+        }
+        std::ranges::sort(times);
+        std::cout << "Shader capture " << stages << " stages: median " << times[4] << " us/draw, p95 pass " << times.back() << " us, checksum " << checksum << '\n';
+    }
+}
+
+void verifyBindlessTable(bool benchmark = false) {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Format8888UNorm = 56;
     constexpr std::uint32_t Type2D = 9;
@@ -283,6 +365,10 @@ void verifyBindlessTable() {
     };
 
     auto request = makeRequest(materialCode);
+    if (benchmark) {
+        captureBenchmark(request);
+        return;
+    }
     const auto plan = GetResourcePlan(request);
     std::size_t tables = 0;
     for (const auto& source : plan->descriptorSources) {
@@ -1033,9 +1119,20 @@ void verifyFunctionLdsBound() {
     require(unsized == FunctionLdsDwordLimit, "function LDS: an access without a known width must keep the full array");
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-capture") {
+            verifyBindlessTable(true);
+            return 0;
+        }
         using namespace ShaderRecompiler;
+        verifyReadMask<1>();
+        verifyReadMask<63>();
+        verifyReadMask<64>();
+        verifyReadMask<65>();
+        verifyReadMask<127>();
+        verifyReadMask<128>();
+        verifyReadMask<1024>();
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyPureFlatSlots();

@@ -195,8 +195,8 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         page.words[index] = word;
         page.valid.set(index);
     }
-    page.read.set(index);
-    page.recent.set(index);
+    page.read.Set(index);
+    page.recent.Set(index);
     *value = page.words[index];
     return true;
 }
@@ -257,15 +257,9 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
             result.push_back({next->first, next->second});
             ++next;
         }
-        for (std::size_t index = 0; index < PageWords;) {
-            if (!page.read.test(index)) {
-                ++index;
-                continue;
-            }
-            const auto first = index;
-            while (index < PageWords && page.read.test(index)) ++index;
-            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, index - first))});
-        }
+        page.read.ForEachRun([&](std::size_t first, std::size_t count) {
+            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, count))});
+        });
     }
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
     return result;
@@ -274,17 +268,10 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
     std::vector<ShaderRecompiler::MemoryRegion> result;
     for (auto& [base, page] : pages) {
-        if (page.recent.none()) continue;
-        for (std::size_t index = 0; index < PageWords;) {
-            if (!page.recent.test(index)) {
-                ++index;
-                continue;
-            }
-            const auto first = index;
-            while (index < PageWords && page.recent.test(index)) ++index;
-            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, index - first))});
-        }
-        page.recent.reset();
+        page.recent.ForEachRun([&](std::size_t first, std::size_t count) {
+            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, count))});
+        });
+        page.recent.Reset();
     }
     return result;
 }

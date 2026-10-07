@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERMEMORY_HPP
 
 #include "Recompiler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderReadMask.hpp"
 #include <array>
 #include <bitset>
 #include <cstddef>
@@ -76,8 +77,8 @@ private:
     struct Page {
         std::array<std::uint32_t, PageWords> words{};
         std::bitset<PageWords> valid;
-        std::bitset<PageWords> read;
-        std::bitset<PageWords> recent;
+        ShaderReadMask<PageWords> read;
+        ShaderReadMask<PageWords> recent;
         bool wordwise = false;
     };
 
