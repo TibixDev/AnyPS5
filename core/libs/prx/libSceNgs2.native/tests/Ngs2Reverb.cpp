@@ -178,6 +178,38 @@ static void TestDryRoutingAndErrors() {
     Require(unchanged[0] == out[0] && unchanged[1] == out[1]);
 }
 
+static void TestRoundedBoundaries() {
+    struct Boundary {
+        float Ngs2ReverbI3dl2Param::*field;
+        float minimum;
+        float maximum;
+    };
+    const Boundary boundaries[]{
+        {&Ngs2ReverbI3dl2Param::wet, 0.0f, 1.0f},
+        {&Ngs2ReverbI3dl2Param::dry, 0.0f, 1.0f},
+        {&Ngs2ReverbI3dl2Param::decay_time, 0.1f, 20.0f},
+        {&Ngs2ReverbI3dl2Param::decay_hf_ratio, 0.1f, 2.0f},
+        {&Ngs2ReverbI3dl2Param::reflections_delay, 0.0f, 0.3f},
+        {&Ngs2ReverbI3dl2Param::reverb_delay, 0.0f, 0.1f},
+        {&Ngs2ReverbI3dl2Param::diffusion, 0.0f, 100.0f},
+        {&Ngs2ReverbI3dl2Param::density, 0.0f, 100.0f},
+        {&Ngs2ReverbI3dl2Param::hf_reference, 20.0f, 20000.0f},
+    };
+    for (const auto& boundary : boundaries) {
+        for (bool upper : {false, true}) {
+            auto param = Parameters();
+            param.*boundary.field = upper ? boundary.maximum : boundary.minimum;
+            const auto exact = Impulse(param, 64, 4096);
+            const auto direction = upper ? std::numeric_limits<float>::infinity() : -std::numeric_limits<float>::infinity();
+            param.*boundary.field = std::nextafter(param.*boundary.field, direction);
+            Require(Impulse(param, 64, 4096) == exact);
+            param.*boundary.field = std::nextafter(param.*boundary.field, direction);
+            Graph graph(64, 1, 1, Parameters());
+            Reject([&] { graph.Configure(param); });
+        }
+    }
+}
+
 static void TestDelaysAndMillibels() {
     auto param = Parameters();
     param.reflections_delay = 16.0f / 48000;
@@ -301,6 +333,7 @@ static void TestGrainsAndLifecycle() {
 int main() {
     TestLifecycle();
     TestDryRoutingAndErrors();
+    TestRoundedBoundaries();
     TestDelaysAndMillibels();
     TestDecayAndSurround();
     TestHighFrequencyAttenuation();

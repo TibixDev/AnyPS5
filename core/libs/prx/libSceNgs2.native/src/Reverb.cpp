@@ -2,9 +2,11 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <limits>
 #include <numbers>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 
 #include "Ngs2Internal.hpp"
 #include "prx/libc/include/General.hpp"
@@ -90,12 +92,18 @@ void Ngs2Reverb::Clear() {
     remainingSamples = 0;
 }
 
-void Ngs2SetReverb(Ngs2Voice& voice, const Ngs2ReverbI3dl2Param& param) {
+void Ngs2SetReverb(Ngs2Voice& voice, const Ngs2ReverbI3dl2Param& requested) {
+    auto param = requested;
     if (voice.inputChannels == 0 || voice.channels == 0) throw std::invalid_argument("NGS2: reverb voice must be set up before I3DL2 control");
     if (voice.inputChannels > 2 || (voice.channels != 1 && voice.channels != 2 && voice.channels != 4 && voice.channels != 6 && voice.channels != 8))
         throw std::runtime_error("NGS2: reverb channel layout is not implemented");
     if (param.reflection_pattern != 0) throw std::runtime_error("NGS2: reverb reflection pattern " + std::to_string(param.reflection_pattern) + " is not implemented");
-    const auto check = [](const char* name, auto value, auto minimum, auto maximum) {
+    const auto check = [](const char* name, auto& value, auto minimum, auto maximum) {
+        if constexpr (std::is_floating_point_v<decltype(minimum)>) {
+            const auto infinity = std::numeric_limits<decltype(minimum)>::infinity();
+            if (value == std::nextafter(minimum, -infinity)) value = minimum;
+            if (value == std::nextafter(maximum, infinity)) value = maximum;
+        }
         if (std::isfinite(value) && value >= minimum && value <= maximum) return;
         std::ostringstream message;
         message.precision(9);
