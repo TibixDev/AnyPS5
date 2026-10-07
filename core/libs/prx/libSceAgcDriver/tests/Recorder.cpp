@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -2584,8 +2585,55 @@ void depthClearPassTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
-void clearDepthAttachment(const Context& context, Recorder& recorder, const DepthTarget& target, float depth) {
+class DepthOperations {
+public:
+    explicit DepthOperations(Context& context) : context(context), resolver(context.deviceProc),
+        createImage(context.Function<PFN_vkCreateImage>("vkCreateImage")),
+        copyImage(context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")),
+        uploadImage(context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")) {
+        Require(active == nullptr, "nested depth operation counters");
+        active = this;
+        context.deviceProc = Resolve;
+    }
+    ~DepthOperations() {
+        context.deviceProc = resolver;
+        active = nullptr;
+    }
+    std::size_t images = 0;
+    std::size_t copies = 0;
+    std::size_t uploads = 0;
+
+private:
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Resolve(VkDevice device, const char* name) {
+        if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(CreateImage);
+        if (std::strcmp(name, "vkCmdCopyImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(CopyImage);
+        if (std::strcmp(name, "vkCmdCopyBufferToImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(UploadImage);
+        return active->resolver(device, name);
+    }
+    static VKAPI_ATTR VkResult VKAPI_CALL CreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
+        const auto result = active->createImage(device, info, allocator, image);
+        if (result == VK_SUCCESS) ++active->images;
+        return result;
+    }
+    static VKAPI_ATTR void VKAPI_CALL CopyImage(VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, std::uint32_t count, const VkImageCopy* regions) {
+        active->copies += count;
+        active->copyImage(commands, source, sourceLayout, destination, destinationLayout, count, regions);
+    }
+    static VKAPI_ATTR void VKAPI_CALL UploadImage(VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+        active->uploads += count;
+        active->uploadImage(commands, source, destination, layout, count, regions);
+    }
+    Context& context;
+    PFN_vkGetDeviceProcAddr resolver;
+    PFN_vkCreateImage createImage;
+    PFN_vkCmdCopyImage copyImage;
+    PFN_vkCmdCopyBufferToImage uploadImage;
+    static inline DepthOperations* active = nullptr;
+};
+
+void clearDepthAttachment(const Context& context, Recorder& recorder, const DepthTarget& target, float depth, const std::function<void()>& beforeWrite = {}) {
     const auto view = DepthSurfaceView(context, target);
+    if (beforeWrite) beforeWrite();
     VkAttachmentDescription attachment{};
     attachment.format = target.format;
     attachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -2642,11 +2690,13 @@ void clearDepthAttachment(const Context& context, Recorder& recorder, const Dept
     const auto commands = recorder.Commands();
     context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
     context.Function<PFN_vkCmdEndRenderPass>("vkCmdEndRenderPass")(commands);
+    NoteDepthSurfaceWrite(context, target, VK_IMAGE_ASPECT_DEPTH_BIT);
     recorder.Sync();
 }
 
 void depthArrayTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
+    DepthOperations operations(context);
     TextureDetiler detiler(context);
     context.detiler = &detiler;
     TextureCache cache(context);
@@ -2700,6 +2750,25 @@ void depthArrayTests(const Device& device, Recorder& recorder) {
         for (std::uint32_t layer = 0; layer < targets.size(); ++layer) expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, static_cast<float>(layer)), targets[layer].clearDepth, "depth array slice contents");
         expectRed(flatProgram.Red(texture->FirstLayerView(), texture->Layout(), 0), targets[0].clearDepth, "depth array first-layer view");
         Require(sample(resource) == texture, "an unchanged depth array was not reused");
+        const auto readOnlyCopies = operations.copies;
+        static_cast<void>(DepthSurfaceView(context, targets[2]));
+        State readOnly{};
+        readOnly.depth = targets[2];
+        readOnly.depthTest = true;
+        readOnly.stencilTest = stencil;
+        readOnly.stencilFront.writeMask = 0xff;
+        readOnly.stencilBack.passOp = VK_STENCIL_OP_REPLACE;
+        NoteDepthSurfaceWrite(context, readOnly);
+        static_cast<void>(sample(resource));
+        Require(operations.copies == readOnlyCopies, "read-only attachment use copied a depth array");
+        auto disabled = readOnly;
+        disabled.depthTest = false;
+        disabled.depthWrite = true;
+        disabled.stencilTest = false;
+        disabled.stencilFront.passOp = VK_STENCIL_OP_REPLACE;
+        NoteDepthSurfaceWrite(context, disabled);
+        static_cast<void>(sample(resource));
+        Require(operations.copies == readOnlyCopies, "disabled depth testing copied a depth array");
         ShaderRecompiler::RecompileResult compiled;
         ShaderRecompiler::DescriptorBinding binding;
         binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
@@ -2730,7 +2799,10 @@ void depthArrayTests(const Device& device, Recorder& recorder) {
         subset.baseArray = 3;
         subsetTexture = sample(subset);
         expectRed(arrayProgram.Red(subsetTexture->View(), subsetTexture->Layout(), 0, 0), targets[3].clearDepth, "single-layer depth array");
-        clearDepthAttachment(context, recorder, targets[2], 0.625f);
+        clearDepthAttachment(context, recorder, targets[2], 0.625f, [&] {
+            Require(sample(resource) == texture, "attachment setup replaced a depth array view");
+            expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.875f, "depth array changed before the attachment write");
+        });
         Require(bindings.ProveCurrent(shader), "depth array bindings failed revalidation after attachment use");
         expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.625f, "depth array retained old attachment contents");
         auto shifted = resource;
@@ -2747,12 +2819,32 @@ void depthArrayTests(const Device& device, Recorder& recorder) {
             stencilResource.format = 5;
             const auto stencilTexture = sample(stencilResource);
             for (std::uint32_t layer = 0; layer < targets.size(); ++layer) expectRed(stencilProgram.Red(stencilTexture->View(), stencilTexture->Layout(), 0, static_cast<float>(layer)), targets[layer].clearStencil, "stencil array slice contents");
+            const auto stencilCopies = operations.copies;
+            NoteDepthSurfaceWrite(context, readOnly);
+            static_cast<void>(sample(stencilResource));
+            Require(operations.copies == stencilCopies, "read-only attachment use copied a stencil array");
             targets[2].clearStencil = 37;
             RunDepthClearPass(context, {targets[2], VK_IMAGE_ASPECT_STENCIL_BIT});
             Require(sample(stencilResource) == stencilTexture, "stencil array view changed after a clear");
             expectRed(stencilProgram.Red(stencilTexture->View(), stencilTexture->Layout(), 0, 2), 37, "stencil array retained a cleared layer");
+            Require(operations.copies == stencilCopies + 1, "a stencil clear copied unchanged slices");
             static_cast<void>(sample(resource));
+            Require(operations.copies == stencilCopies + 1, "a stencil-only clear copied depth");
             expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.625f, "stencil array clear changed depth");
+            RunDepthClearPass(context, {targets[2], VK_IMAGE_ASPECT_DEPTH_BIT});
+            static_cast<void>(sample(stencilResource));
+            Require(operations.copies == stencilCopies + 1, "a depth-only clear copied stencil");
+            expectRed(stencilProgram.Red(stencilTexture->View(), stencilTexture->Layout(), 0, 2), 37, "depth array clear changed stencil");
+            static_cast<void>(sample(resource));
+            Require(operations.copies == stencilCopies + 2, "a depth clear copied unchanged slices");
+            expectRed(arrayProgram.Red(texture->View(), texture->Layout(), 0, 2), targets[2].clearDepth, "depth-only clear did not refresh depth");
+            auto writableStencil = readOnly;
+            writableStencil.stencilBack.writeMask = 0xff;
+            NoteDepthSurfaceWrite(context, writableStencil);
+            static_cast<void>(sample(resource));
+            Require(operations.copies == stencilCopies + 2, "a stencil-writing state copied depth");
+            static_cast<void>(sample(stencilResource));
+            Require(operations.copies == stencilCopies + 3, "a stencil-writing state did not refresh its slice");
         }
         auto missing = resource;
         missing.depthOrLastArray = 4;
