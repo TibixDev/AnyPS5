@@ -394,8 +394,6 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
 #endif
     decideImportWatch(context, state);
-    if (state.unwatchImports) GuestMemory::Unwatch(base, bytes);
-    entry.unwatched = state.unwatchImports;
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
     GuestMemory::ImportWatched(base, bytes, [&] {
@@ -432,6 +430,11 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #endif
         return nullptr;
     }
+    entry.unwatched = state.unwatchImports && entry.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+#ifndef _WIN32
+    if (importWatchRequest() == ImportWatchRequest::Unwatch) entry.unwatched = true;
+#endif
+    if (entry.unwatched) GuestMemory::Unwatch(base, bytes);
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
