@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -511,7 +512,23 @@ static void TestAllocator() {
     Require(sceNgs2RackDestroy(master, nullptr) == SCE_NGS2_ERROR_INVALID_RACK_HANDLE);
 }
 
-int main() {
+static uintptr_t exitSystem = 0;
+static uintptr_t exitVoice = 0;
+
+static void CheckExitOrder() {
+    Ngs2SamplerVoiceState state{};
+    Require(sceNgs2VoiceGetState(exitVoice, &state.voice_state, sizeof(state)) == SCE_NGS2_OK);
+    Require(state.voice_state.state_flags == 0);
+    Require(sceNgs2SystemDestroy(exitSystem, nullptr) == SCE_NGS2_OK);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--exit-order") {
+        Require(std::atexit(CheckExitOrder) == 0);
+        exitSystem = CreateSystem();
+        exitVoice = Voice(CreateRack(exitSystem, SCE_NGS2_RACK_ID_SAMPLER));
+        return 0;
+    }
     TestErrorsAndInfo();
     TestPcmBlockEnd();
     TestPan();

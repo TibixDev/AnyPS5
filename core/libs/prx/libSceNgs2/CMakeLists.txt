@@ -13,8 +13,9 @@ if(BUILD_TESTING)
     target_link_libraries(ngs2_core_render_tests PRIVATE libSceNgs2 atrac9 libkernel libc)
     configure_windows_unwind(ngs2_core_render_tests)
     add_test(NAME ngs2_core_render COMMAND ngs2_core_render_tests)
+    add_test(NAME ngs2_core_exit_order COMMAND ngs2_core_render_tests --exit-order)
     if(WIN32)
-        set_tests_properties(ngs2_core_render PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(ngs2_core_render ngs2_core_exit_order PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNgs2>")
     endif()
 endif()
