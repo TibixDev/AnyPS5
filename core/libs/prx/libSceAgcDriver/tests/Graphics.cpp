@@ -614,6 +614,7 @@ void DepthBoundsBiasTests() {
         return word;
     };
     auto queue = makeState();
+    queue.context.emplace(0x2df, AgcDriver::QueueState{}.context.at(0x2df));
     queue.context[0x000] = 0;
     queue.context[0x002] = 0;
     queue.context[0x007] = (1u << 16u) | 3u;
@@ -632,11 +633,16 @@ void DepthBoundsBiasTests() {
     const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
     Require(rejection.empty(), "precheck rejected depth bounds with a depth surface: " + rejection);
     queue.context[0x205] = 0x00001a48u;
-    queue.context[0x2df] = bits(0.5f);
     for (const auto offset : {0x2e0u, 0x2e2u}) queue.context[offset] = bits(32.0f);
     for (const auto offset : {0x2e1u, 0x2e3u}) queue.context[offset] = bits(4.0f);
     state = AgcDriver::Graphics::DecodeState(queue);
-    Require(state.depthBias && state.depthBiasSlope == 2.0f && state.depthBiasConstant == 4.0f && state.depthBiasClamp == 0.5f, "depth bias decode changed");
+    Require(state.depthBias && state.depthBiasSlope == 2.0f && state.depthBiasConstant == 4.0f && state.depthBiasClamp == 0.0f, "depth bias clamp reset value changed");
+    queue.context[0x2df] = bits(0.5f);
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depthBias && state.depthBiasClamp == 0.5f, "depth bias clamp decode changed");
+    auto cleared = queue;
+    cleared.ClearContext();
+    Require(cleared.context.at(0x2df) == 0, "CLEAR_STATE did not reset depth bias clamp");
     queue.context[0x2e3] = bits(8.0f);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "differing between front and back");
     queue.context[0x205] = 0x00001a4au;
