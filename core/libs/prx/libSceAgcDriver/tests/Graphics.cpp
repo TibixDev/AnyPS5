@@ -475,6 +475,27 @@ void DisabledColorTests() {
     Require(partial.hasColorTarget && partial.blend.colorWriteMask == 3, "partial color write mask changed");
     queue.context.erase(0x31c);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
+    queue = makeState();
+    queue.context[0x31c] = 0;
+    for (const auto offset : {0x31bu, 0x31du, 0x3b0u, 0x3b8u, 0x390u, 0x318u, 0x1e0u}) queue.context.erase(offset);
+    const auto disabled = AgcDriver::Graphics::DecodeState(queue);
+    Require(!disabled.hasColorTarget && disabled.colors.empty() && disabled.blends.empty(), "COLOR_INVALID retained an attachment despite the disabled buffer");
+    Require(disabled.renderExtent.width == 64 && disabled.renderExtent.height == 4, "COLOR_INVALID lost the attachment-free render extent");
+    queue.shader[0x008] = 0;
+    queue.shader[0x009] = 0;
+    Require(AgcDriver::Graphics::NullPixelProgramRejection(queue).empty(), "COLOR_INVALID rejected a draw without a pixel shader");
+    queue.context[0x200] = 0x36;
+    queue.context[0x000] = 0;
+    queue.context[0x002] = 0;
+    queue.context[0x010] = 0x80000181;
+    queue.context[0x011] = 0x20000180;
+    queue.context[0x012] = 0x100;
+    queue.context[0x014] = 0x100;
+    queue.context[0x007] = 0x003f003f;
+    queue.context[0x00a] = 0;
+    queue.context[0x00b] = std::bit_cast<std::uint32_t>(1.0f);
+    const auto depthOnly = AgcDriver::Graphics::DecodeState(queue);
+    Require(!depthOnly.hasColorTarget && depthOnly.depth && depthOnly.depthTest && depthOnly.depthWrite && depthOnly.renderExtent.height == 64, "COLOR_INVALID discarded a depth-only draw");
 }
 
 void CompactedExportTests() {
@@ -496,6 +517,10 @@ void CompactedExportTests() {
     Require(state.colors[1].slot == 4 && state.colors[1].exportIndex == 1 && state.colors[1].address == slotFour, "export 1 did not reach MRT slot 4, the second slot CB_SHADER_MASK enables");
     Require(!state.blends[0].blendEnable && state.blends[1].blendEnable && state.blends[1].colorWriteMask == (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT), "export 1 did not take MRT slot 4's blend control and target mask");
     Require(AgcDriver::Graphics::ExportMappings(state)[1] == state.colors[1].componentMapping, "export 1 did not take MRT slot 4's component mapping");
+    auto disabledFirst = queue;
+    disabledFirst.context[0x31c] = 0;
+    const auto withHole = AgcDriver::Graphics::DecodeState(disabledFirst);
+    Require(withHole.colors.size() == 1 && withHole.colors[0].slot == 4 && withHole.colors[0].exportIndex == 1 && withHole.blends.size() == 2 && withHole.blends[0].colorWriteMask == 0, "COLOR_INVALID shifted a later MRT export");
     queue.context[0x1c5] = 0x90009u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 0");
     queue.context[0x8e] = 0xf000fu;
