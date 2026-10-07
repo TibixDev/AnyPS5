@@ -846,7 +846,7 @@ void CreateDirectMemoryBacking(int64_t start, size_t len, int memoryType) {
     static std::once_flag registered;
     std::call_once(registered, [] {
         GuestArena::GuestArenaSetSharedBacking_nid_postfix(&SharedBacking);
-        GuestArena::GuestArenaSetSharedBackingWriter_nid_postfix(&WriteSharedBacking);
+        GuestArena::GuestArenaSetSharedBackingWriter_nid_no_patch(&WriteSharedBacking);
     });
 #endif
     const auto backing = std::make_shared<PhysicalBacking>(len, memoryType);

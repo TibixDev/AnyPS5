@@ -15,11 +15,11 @@ class ResultMemoAdmission {
 public:
     bool Observe(std::uint64_t variant, std::uint64_t hash) {
         const Key key{variant, hash};
-        auto bucket = Find(key);
+        auto bucket = find(key);
         if (buckets[bucket] != 0) return true;
         if (size == entries.size()) {
-            Erase(entries[next]);
-            bucket = Find(key);
+            erase(entries[next]);
+            bucket = find(key);
         } else {
             ++size;
         }
@@ -35,31 +35,31 @@ private:
         std::uint64_t hash;
         bool operator==(const Key&) const = default;
     };
-    static constexpr std::size_t BucketMask = 511;
-    static std::size_t Home(const Key& key) {
+    static constexpr std::size_t bucketMask = 511;
+    static std::size_t homeBucket(const Key& key) {
         const auto hash = ResultMemoIndex(key.variant, key.hash);
-        return (hash ^ (hash >> 33u)) & BucketMask;
+        return (hash ^ (hash >> 33u)) & bucketMask;
     }
-    std::size_t Find(const Key& key) const {
-        auto bucket = Home(key);
-        while (buckets[bucket] != 0 && entries[buckets[bucket] - 1] != key) bucket = (bucket + 1) & BucketMask;
+    std::size_t find(const Key& key) const {
+        auto bucket = homeBucket(key);
+        while (buckets[bucket] != 0 && entries[buckets[bucket] - 1] != key) bucket = (bucket + 1) & bucketMask;
         return bucket;
     }
-    void Erase(const Key& key) {
-        auto hole = Find(key);
-        auto scan = (hole + 1) & BucketMask;
+    void erase(const Key& key) {
+        auto hole = find(key);
+        auto scan = (hole + 1) & bucketMask;
         while (buckets[scan] != 0) {
-            const auto home = Home(entries[buckets[scan] - 1]);
-            if (((scan - home) & BucketMask) >= ((scan - hole) & BucketMask)) {
+            const auto home = homeBucket(entries[buckets[scan] - 1]);
+            if (((scan - home) & bucketMask) >= ((scan - hole) & bucketMask)) {
                 buckets[hole] = buckets[scan];
                 hole = scan;
             }
-            scan = (scan + 1) & BucketMask;
+            scan = (scan + 1) & bucketMask;
         }
         buckets[hole] = 0;
     }
     std::array<Key, 256> entries{};
-    std::array<std::uint16_t, BucketMask + 1> buckets{};
+    std::array<std::uint16_t, bucketMask + 1> buckets{};
     std::size_t next = 0;
     std::size_t size = 0;
 };

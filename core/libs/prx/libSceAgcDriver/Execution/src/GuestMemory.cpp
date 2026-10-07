@@ -533,7 +533,7 @@ public:
 
     void Remember(std::uintptr_t address, PageRun run, std::uint64_t observedGeneration) {
         if (!run.readable) return;
-        const auto allocation = GuestAllocations::GuestAllocationsTryDescribeRange_nid_postfix(address);
+        const auto allocation = GuestAllocations::GuestAllocationsTryDescribeRange_nid_no_patch(address);
         if (allocation.bytes == 0 || generation != observedGeneration || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != observedGeneration) return;
         run.begin = std::max<std::uintptr_t>(run.begin, allocation.address);
         run.end = std::min<std::uintptr_t>(run.end, allocation.address + allocation.bytes);
@@ -1298,7 +1298,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
     return StoreOwnBytes(address, source.size(), [&] {
 #ifndef _WIN32
-        if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_postfix(address, source.data(), source.size())) return;
+        if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size())) return;
 #endif
         std::memcpy(reinterpret_cast<void*>(address), source.data(), source.size());
     });

@@ -21,7 +21,7 @@ void Require(bool value, std::source_location where = std::source_location::curr
 
 auto Generation() { return GuestAllocationsGeneration_nid_postfix(); }
 auto Validate(std::uintptr_t address, std::size_t bytes, std::uint64_t since) {
-    return GuestAllocationsValidateMapping_nid_postfix(address, bytes, since);
+    return GuestAllocationsValidateMapping_nid_no_patch(address, bytes, since);
 }
 
 void MappingChanges() {

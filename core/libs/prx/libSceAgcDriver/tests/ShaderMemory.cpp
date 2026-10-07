@@ -194,21 +194,21 @@ void verifyPureFlatSlots() {
 
 // A compute program sampling a T# loaded from a table buffer at a runtime key (a bindless image
 // table): mode M enumerates the keys from the material records, mode T binds the whole table.
-template<std::size_t Size>
+template<std::size_t TSize>
 void verifyReadMask() {
-    std::mt19937_64 random(Size);
+    std::mt19937_64 random(TSize);
     for (unsigned trial = 0; trial < 2048; ++trial) {
-        AgcDriver::ShaderReadMask<Size> mask;
-        std::array<bool, Size> bits{};
-        for (std::size_t i = 0; i < Size; ++i) {
+        AgcDriver::ShaderReadMask<TSize> mask;
+        std::array<bool, TSize> bits{};
+        for (std::size_t i = 0; i < TSize; ++i) {
             bits[i] = trial == 0 ? false : trial == 1 ? true : trial == 2 ? i % 2 != 0 : trial == 3 ? i % 64 == 0 || i % 64 == 63 : random() % (1 + trial % 17) == 0;
             if (bits[i]) mask.Set(i);
         }
         std::vector<std::pair<std::size_t, std::size_t>> expected, actual;
-        for (std::size_t i = 0; i < Size;) {
+        for (std::size_t i = 0; i < TSize;) {
             if (!bits[i]) { ++i; continue; }
             const auto begin = i;
-            while (i < Size && bits[i]) ++i;
+            while (i < TSize && bits[i]) ++i;
             expected.emplace_back(begin, i - begin);
         }
         const auto collect = [&](std::size_t first, std::size_t count) { actual.emplace_back(first, count); };
@@ -222,7 +222,7 @@ void verifyReadMask() {
         mask.ForEachRun(collect);
         require(actual.empty(), "reset shader read mask retained a range");
         bool rejected = false;
-        try { mask.Set(Size); } catch (const std::out_of_range&) { rejected = true; }
+        try { mask.Set(TSize); } catch (const std::out_of_range&) { rejected = true; }
         require(rejected, "shader read mask accepted an out-of-range word");
     }
 }

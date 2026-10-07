@@ -44,7 +44,7 @@ void same(const VertexInputLayout& a, const VertexInputLayout& b) {
     }
 }
 
-template<class F> void fails(F&& fn) {
+template<class TAction> void fails(TAction&& fn) {
     bool failed = false;
     try { fn(); } catch (const std::runtime_error&) { failed = true; }
     Require(failed, "invalid vertex input was accepted");
