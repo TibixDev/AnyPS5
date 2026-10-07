@@ -3,6 +3,7 @@
 #include <bit>
 #include <cmath>
 #include <numbers>
+#include <sstream>
 #include <stdexcept>
 
 #include "Ngs2Internal.hpp"
@@ -12,10 +13,6 @@ namespace {
 
 constexpr float InverseRootEight = 0.3535533905932738f;
 constexpr std::array<double, 8> DelaySeconds{0.0127, 0.0179, 0.0211, 0.0253, 0.0299, 0.0337, 0.0391, 0.0439};
-
-bool InRange(float value, float minimum, float maximum) {
-    return std::isfinite(value) && value >= minimum && value <= maximum;
-}
 
 double Gain(std::int32_t millibels) {
     return std::pow(10.0, millibels / 2000.0);
@@ -98,13 +95,26 @@ void Ngs2SetReverb(Ngs2Voice& voice, const Ngs2ReverbI3dl2Param& param) {
     if (voice.inputChannels > 2 || (voice.channels != 1 && voice.channels != 2 && voice.channels != 4 && voice.channels != 6 && voice.channels != 8))
         throw std::runtime_error("NGS2: reverb channel layout is not implemented");
     if (param.reflection_pattern != 0) throw std::runtime_error("NGS2: reverb reflection pattern " + std::to_string(param.reflection_pattern) + " is not implemented");
-    if (!InRange(param.wet, 0.0f, 1.0f) || !InRange(param.dry, 0.0f, 1.0f) ||
-        param.room < -10000 || param.room > 0 || param.room_hf < -10000 || param.room_hf > 0 ||
-        !InRange(param.decay_time, 0.1f, 20.0f) || !InRange(param.decay_hf_ratio, 0.1f, 2.0f) ||
-        param.reflections < -10000 || param.reflections > 1000 || param.reverb < -10000 || param.reverb > 2000 ||
-        !InRange(param.reflections_delay, 0.0f, 0.3f) || !InRange(param.reverb_delay, 0.0f, 0.1f) ||
-        !InRange(param.diffusion, 0.0f, 100.0f) || !InRange(param.density, 0.0f, 100.0f) ||
-        !InRange(param.hf_reference, 20.0f, 20000.0f)) APS5_INVALID_ARG_EX;
+    const auto check = [](const char* name, auto value, auto minimum, auto maximum) {
+        if (std::isfinite(value) && value >= minimum && value <= maximum) return;
+        std::ostringstream message;
+        message.precision(9);
+        message << "NGS2: reverb " << name << '=' << value << " is outside [" << minimum << ", " << maximum << ']';
+        throw std::invalid_argument(message.str());
+    };
+    check("wet", param.wet, 0.0f, 1.0f);
+    check("dry", param.dry, 0.0f, 1.0f);
+    check("room", param.room, -10000, 0);
+    check("room_hf", param.room_hf, -10000, 0);
+    check("decay_time", param.decay_time, 0.1f, 20.0f);
+    check("decay_hf_ratio", param.decay_hf_ratio, 0.1f, 2.0f);
+    check("reflections", param.reflections, -10000, 1000);
+    check("reverb", param.reverb, -10000, 2000);
+    check("reflections_delay", param.reflections_delay, 0.0f, 0.3f);
+    check("reverb_delay", param.reverb_delay, 0.0f, 0.1f);
+    check("diffusion", param.diffusion, 0.0f, 100.0f);
+    check("density", param.density, 0.0f, 100.0f);
+    check("hf_reference", param.hf_reference, 20.0f, 20000.0f);
     const auto rate = voice.rack->system->option.sample_rate;
     if (param.hf_reference >= rate * 0.5 || rate > 192000)
         throw std::runtime_error("NGS2: reverb sample rate or HF reference is not supported");
