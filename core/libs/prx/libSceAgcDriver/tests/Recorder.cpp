@@ -1717,6 +1717,88 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void shaderDataSliceTests(const Device& device, Recorder& outer) {
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    context.limits.minStorageBufferOffsetAlignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    DescriptorUpdates updates(context);
+    DescriptorCache descriptors(context);
+    context.descriptorCache = &descriptors;
+    Recorder recorder(context);
+    recorder.Activate();
+    struct Restore {
+        Recorder& recorder;
+        Recorder& outer;
+        ~Restore() { recorder.Sync(); outer.Activate(); }
+    } restore{recorder, outer};
+    const auto [guard, guardOffset] = recorder.AllocateDrawUpload(32);
+    std::fill_n(guard->Bytes().begin() + guardOffset, 32, std::byte{0xaa});
+    alignas(64) std::array<std::uint32_t, 8> guest{1, 2, 3, 4, 5, 6, 7, 8};
+    ShaderRecompiler::RecompileResult program;
+    program.variantId = 1000020;
+    program.memoryOffsetDword = 2;
+    ShaderRecompiler::DescriptorBinding buffers{};
+    buffers.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    buffers.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    buffers.binding = 0;
+    buffers.count = 2;
+    buffers.bufferWritten = {false, false};
+    for (const auto [pointer, bytes] : {std::pair{guest.data(), 32u}, std::pair{guest.data() + 1, 8u}}) {
+        const auto address = reinterpret_cast<std::uint64_t>(pointer);
+        for (auto word : {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), bytes, 0x31016facu}) buffers.guestDescriptor.push_back(word);
+    }
+    program.bindings.push_back(buffers);
+    ShaderRecompiler::DescriptorBinding data{};
+    data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    data.role = ShaderRecompiler::DescriptorRole::ShaderData;
+    data.binding = 3;
+    data.count = 1;
+    data.guestDescriptor = {0x11, 0x22, 0};
+    program.bindings.push_back(data);
+    data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    data.binding = 5;
+    data.guestDescriptor = {5, 6, 7, 8};
+    program.bindings.push_back(data);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader, std::span<const GuestMemorySnapshot>{}, true);
+    Require(updates.calls.empty(), "deferred shader data published descriptors before completion");
+    resources->Complete();
+    recorder.Keep(resources);
+    const auto first = updates.calls.back().buffers.at({3, 0});
+    const auto second = updates.calls.back().buffers.at({5, 0});
+    Require(first.buffer == guard->Handle() && second.buffer == first.buffer && first.offset > guardOffset && second.offset >= first.offset + first.range, "shader data did not use distinct aligned page slices");
+    Require(first.offset % context.limits.minStorageBufferOffsetAlignment == 0 && second.offset % context.limits.minStorageBufferOffsetAlignment == 0, "shader data slice is misaligned");
+    Buffer readback(context, 84, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto read = [&](std::size_t destination) {
+        CopyBuffer(context, recorder.Commands(), first.buffer, first.offset, readback.Handle(), destination, first.range);
+        CopyBuffer(context, recorder.Commands(), second.buffer, second.offset, readback.Handle(), destination + first.range, second.range);
+    };
+    read(0);
+    auto changed = program;
+    changed.bindings[1].guestDescriptor = {0x33, 0x44, 0};
+    const CompiledShader live{ShaderRecompiler::ShaderStage::Compute, &changed, 0};
+    const auto refresh = [&](const CompiledShader& current) {
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        Require(resources->RefreshData(recorder.Commands(), current, &recorder), "shader data refresh did not record changed words");
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    };
+    refresh(live);
+    read(28);
+    refresh(shader);
+    read(56);
+    Require(!resources->RefreshData(recorder.Commands(), shader, &recorder), "unchanged shader data refreshed again");
+    program = {};
+    changed = {};
+    resources.reset();
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Sync();
+    const std::array<std::uint32_t, 21> expected{0x11, 0x22, 0x400, 5, 6, 7, 8, 0x33, 0x44, 0x400, 5, 6, 7, 8, 0x11, 0x22, 0x400, 5, 6, 7, 8};
+    Require(std::memcmp(readback.Bytes().data(), expected.data(), sizeof(expected)) == 0, "shader data updates lost ordering, alignment patches or neighboring slices");
+    Require(std::all_of(guard->Bytes().begin() + guardOffset, guard->Bytes().begin() + guardOffset + 32, [](auto byte) { return byte == std::byte{0xaa}; }), "shader data overwrote another draw's page slice");
+    std::cout << "Shader data slices preserve deferred construction, patches, neighboring data and GPU-ordered refreshes\n";
+}
+
 void drawUploadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     constexpr std::array<std::size_t, 7> sizes{4, 260, 4096, 65532, 12, 65540, 8188};
@@ -1935,7 +2017,7 @@ void drawBindingsBenchmark(const Device& device) {
     std::cout << "Draw binding benchmark: " << times[3] << " us/draw median, " << times.front() << " minimum, " << times.back() << " maximum, " << DeviceProcLookups() - lookups << " device lookups, checksum " << checksum << '\n';
 }
 
-void resourceBuildBenchmark(const Device& device) {
+void resourceBuildBenchmark(const Device& device, bool shaderData = false) {
     std::unique_lock gpu(GpuMutex());
     auto context = device.GetContext();
     context.hostImportAlignment = 0;
@@ -1971,12 +2053,13 @@ void resourceBuildBenchmark(const Device& device) {
         for (std::uint32_t i = 0; i < 8; ++i) {
             ShaderRecompiler::DescriptorBinding binding{};
             binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
-            binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+            binding.role = shaderData ? (i % 2 == 0 ? ShaderRecompiler::DescriptorRole::ShaderData : ShaderRecompiler::DescriptorRole::FlattenedSrt) : ShaderRecompiler::DescriptorRole::GuestBuffers;
             binding.binding = i;
             binding.count = 1;
             binding.bufferWritten = {false};
             const auto base = address + i * inputBytes;
             binding.guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32), inputBytes, 0x31016fac};
+            if (shaderData) binding.guestDescriptor.resize(inputBytes / 4, i + 1);
             program.bindings.push_back(std::move(binding));
         }
         for (std::uint32_t i = 0; i < imageCount; ++i) {
@@ -2014,7 +2097,7 @@ void resourceBuildBenchmark(const Device& device) {
             if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / 1024;
         }
         std::sort(times.begin(), times.end());
-        std::cout << "Resource batches (" << inputBytes << " byte inputs, " << imageCount << " textures): median " << times[4] << " us/draw, p95 pass " << times[8] << " us/draw, minimum " << times[0] << " us, checksum " << checksum << '\n';
+        std::cout << (shaderData ? "Shader data batches (" : "Resource batches (") << inputBytes << " byte inputs, " << imageCount << " textures): median " << times[4] << " us/draw, p95 pass " << times[8] << " us/draw, minimum " << times[0] << " us, checksum " << checksum << '\n';
     }
     }
 }
@@ -4335,6 +4418,10 @@ int main(int argc, char** argv) {
             resourceBuildBenchmark(device);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-shader-data") {
+            resourceBuildBenchmark(device, true);
+            return 0;
+        }
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
@@ -4357,6 +4444,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--copied-buffers-only") {
             copiedBufferResidencyTests(device, recorder);
             copiedBackingTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--shader-data-only") {
+            shaderDataSliceTests(device, recorder);
+            dataRefreshTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-upload-only") {
@@ -4453,6 +4545,7 @@ int main(int argc, char** argv) {
         importWindowTests(device, recorder);
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
+        shaderDataSliceTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         singleCubeTests(device, recorder);
