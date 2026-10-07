@@ -1840,7 +1840,12 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     auto* destination = reinterpret_cast<void*>(address);
     CheckRange(destination, source.size(), alignment, true);
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
-    StoreOwnBytes(address, source.size(), [&] { std::memcpy(destination, source.data(), source.size()); });
+    StoreOwnBytes(address, source.size(), [&] {
+#ifndef _WIN32
+        if (source.size() >= PageBytes && GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_postfix(address, source.data(), source.size())) return;
+#endif
+        std::memcpy(destination, source.data(), source.size());
+    });
 }
 
 }
