@@ -47,6 +47,7 @@ void Ngs2Voice::SetEvent(std::uint32_t eventId) {
 }
 
 void Ngs2Voice::ResetSetup() {
+    ++waveformRevision;
     SetEvent(SCE_NGS2_VOICE_EVENT_STOP_IMM);
     std::fill(ports.begin(), ports.end(), Ngs2Port{});
     for (auto& matrix : matrices) matrix.clear();
@@ -158,12 +159,16 @@ static void SetupSampler(Ngs2Voice& voice, const Ngs2WaveformFormat& format) {
 }
 
 static void AddWaveformBlocks(Ngs2Voice& voice, const Ngs2SamplerVoiceWaveformBlocksParam& param) {
-    constexpr std::uint32_t knownFlags = SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE | SCE_NGS2_WAVEFORM_BLOCKS_FLAG_RESET;
+    constexpr std::uint32_t knownFlags = SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE | SCE_NGS2_WAVEFORM_BLOCKS_FLAG_RESET | SCE_NGS2_WAVEFORM_BLOCKS_FLAG_ONLY_DATA;
     if ((param.flags & ~knownFlags) != 0) throw std::runtime_error("NGS2: waveform block flags " + Ngs2Hex(param.flags) + " are not implemented");
     if (voice.channels == 0 || (param.num_blocks != 0 && (param.blocks == nullptr || param.data == nullptr))) APS5_INVALID_ARG_EX;
     const bool reset = (param.flags & SCE_NGS2_WAVEFORM_BLOCKS_FLAG_RESET) != 0;
+    const bool onlyData = (param.flags & SCE_NGS2_WAVEFORM_BLOCKS_FLAG_ONLY_DATA) != 0;
+    if (onlyData && voice.waveformType != SCE_NGS2_WAVEFORM_TYPE_ATRAC9)
+        throw std::runtime_error("NGS2: data-only blocks require a compressed waveform");
     if (!voice.acceptsBlocks && !reset) throw std::invalid_argument("NGS2: the voice waveform was already closed");
     if (reset) {
+        ++voice.waveformRevision;
         voice.blocks.clear();
         voice.phase = 0;
         voice.waveformEnd = nullptr;
@@ -172,11 +177,17 @@ static void AddWaveformBlocks(Ngs2Voice& voice, const Ngs2SamplerVoiceWaveformBl
     voice.acceptsBlocks = (param.flags & SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE) != 0;
     const std::size_t frameBytes = voice.channels * sizeof(std::int16_t);
     for (std::uint32_t i = 0; i < param.num_blocks; i++) {
-        const auto& block = param.blocks[i];
+        auto block = param.blocks[i];
+        if (onlyData) {
+            block.num_samples = 0;
+            block.num_skip_samples = 0;
+            block.num_repeats = 0;
+        }
         if (block.num_samples == 0 && block.data_size == 0) continue;
         const std::uint64_t bytes = voice.waveformType == SCE_NGS2_WAVEFORM_TYPE_ATRAC9 ? Ngs2Atrac9BlockBytes(voice, block)
                                   : (static_cast<std::uint64_t>(block.num_skip_samples) + block.num_samples) * frameBytes;
-        if (block.num_samples == 0 || bytes > block.data_size) {
+        const bool streaming = voice.waveformType == SCE_NGS2_WAVEFORM_TYPE_ATRAC9 && voice.acceptsBlocks && block.num_repeats == 0;
+        if (!onlyData && (block.num_samples == 0 || (bytes > block.data_size && !streaming))) {
             throw std::invalid_argument("NGS2: waveform block " + std::to_string(i) + " does not fit its data");
         }
         voice.blocks.push_back({static_cast<const std::uint8_t*>(param.data) + block.data_offset, block});
