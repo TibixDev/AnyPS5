@@ -30,6 +30,8 @@ struct HostImport {
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
+    std::weak_ptr<const GuestAllocations::Range> range;
+    VkExternalMemoryHandleTypeFlagBits handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };

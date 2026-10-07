@@ -419,6 +419,7 @@ target_link_libraries(agc_driver_recorder_tests PRIVATE
         libSceAgcDriver
         SDL2-static
         libc
+        libkernel
 )
 
 set_target_properties(agc_driver_recorder_tests PROPERTIES CXX_EXTENSIONS OFF)
