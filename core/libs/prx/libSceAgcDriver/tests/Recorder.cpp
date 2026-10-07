@@ -3734,6 +3734,35 @@ void minLodTests(const Device& device, Recorder& recorder) {
     expectRed(sample(0x100, 0.0f, 1), unorm(1), "minimum LOD clamp: MIN_LOD at the view's base level reads its base level");
 }
 
+void singleCubeTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    SampleProgram program(context, recorder, SAMPLE_Depth_ARRAY_SPV);
+    const VkComponentMapping identity{};
+    for (const auto first : {0u, 5u, 6u}) {
+        std::array<std::uint32_t, 8> words{0x1000u, (56u << 20u) | (3u << 30u), 15u | (63u << 14u), 0xb0000facu, first | (first << 16u), 0, 0, 0};
+        auto resource = DecodeTextureResource(words);
+        const auto geometry = DescribeSurface(resource);
+        std::vector<std::byte> memory(static_cast<std::size_t>(geometry.guestBytes) + 256);
+        auto* surface = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255) & ~std::uintptr_t{255});
+        for (std::uint32_t layer = 0; layer < geometry.imageLayers; ++layer) {
+            std::memset(surface + geometry.GuestLayerOffset(layer), 16 * (layer + 1), static_cast<std::size_t>(geometry.layerBytes));
+        }
+        resource.baseAddress = reinterpret_cast<std::uint64_t>(surface);
+        const std::span<const std::byte> snapshot(surface, static_cast<std::size_t>(geometry.guestBytes));
+        Texture texture(context, detiler, resource, identity, snapshot);
+        auto storage = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+        recorder.Keep(storage);
+        Texture storageView(context, storage, resource, identity);
+        for (std::uint32_t face = 0; face < 6; ++face) {
+            const auto expected = 16.0f * (first + face + 1) / 255.0f;
+            expectRed(program.Red(texture.View(), texture.Layout(), 0, face), expected, "single cube snapshot sampled the wrong face");
+            expectRed(program.Red(storageView.View(), storageView.Layout(), 0, face), expected, "single cube storage view sampled the wrong face");
+        }
+    }
+}
+
 void firstLayerViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     TextureDetiler detiler(context);
@@ -3988,6 +4017,11 @@ int main(int argc, char** argv) {
             std::cout << "CMASK resident clear and copy write-back tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
+            singleCubeTests(device, recorder);
+            std::cout << "Single cube snapshot and storage sampling tests passed\n";
+            return 0;
+        }
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
@@ -4023,6 +4057,7 @@ int main(int argc, char** argv) {
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
+        singleCubeTests(device, recorder);
         atomicViewTests(device, recorder);
         metadataPassTests(device, recorder);
         cmaskPassTests(device, recorder);
