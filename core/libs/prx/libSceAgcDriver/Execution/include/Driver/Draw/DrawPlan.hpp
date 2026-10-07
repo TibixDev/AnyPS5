@@ -8,6 +8,8 @@
 #include <span>
 #include <vector>
 
+namespace AgcDriver::Graphics { class VertexStagePlan; }
+
 namespace AgcDriver::DriverDetail {
 
 inline constexpr std::size_t MaxDrawPrograms = 5;
@@ -25,6 +27,7 @@ struct DrawProgramPlan {
     bool merged = false;
     bool mergedPointerRequired = false;
     std::uint32_t mergedPointer = 0;
+    std::shared_ptr<const Graphics::VertexStagePlan> vertexInputs;
 };
 
 struct DrawProgram {
