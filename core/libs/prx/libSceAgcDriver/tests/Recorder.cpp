@@ -209,6 +209,7 @@ private:
     }
 
     void release() noexcept {
+        ClearHostImports(context.device);
         if (context.pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, context.pool, nullptr);
         context.bufferPool.reset();
         if (context.device != VK_NULL_HANDLE) function<PFN_vkDestroyDevice>("vkDestroyDevice")(context.device, nullptr);
@@ -235,7 +236,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL rejectHostImport(VkDevice device, const
     return sharedImportResolver(device, name);
 }
 
-void sharedImportTests(const Device& device, Recorder& recorder) {
+std::weak_ptr<HostImport> sharedImportTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     Require(context.hostImportAlignment != 0, "shared import tests require host import support");
     const auto bytes = static_cast<std::size_t>(std::max<VkDeviceSize>(65536, context.hostImportAlignment));
@@ -273,7 +274,7 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
             if (!checkTracking) return;
             std::memset(original, 0x44, bytes * 3);
             Require(CollectWritesUncached(address, bytes * 3) != 0, "shared backing was not watched before import");
-            const auto* imported = HostImportFor(context, address, bytes * 3);
+            const auto imported = HostImportFor(context, address, bytes * 3);
             Require(imported != nullptr, "import watched shared backing");
             if (imported->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && PrepareImportWatch(context) == ImportWatch::Unwatch) {
                 checkTracking = false;
@@ -317,7 +318,7 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
     std::memset(release.mappings[1], 0x77, bytes);
     const auto address = reinterpret_cast<std::uint64_t>(release.mappings[2]);
     const auto import = [&] {
-        const auto* found = HostImportFor(context, address, bytes);
+        const auto found = HostImportFor(context, address, bytes);
         Require(found != nullptr, "shared direct-memory import failed");
         return *found;
     };
@@ -348,9 +349,22 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
     for (std::size_t i = 0; i < bytes; ++i) {
         Require(original[i] == std::byte{0x11} && original[bytes + i] == std::byte{0x55} && original[bytes * 2 + i] == std::byte{0x33}, "shared GPU write missed its slice or changed a neighbor");
     }
+    auto retained = std::make_unique<GuestBufferMemory>(context);
+    retained->AddReadable(address, bytes);
+    retained->Upload(false);
+    std::uint32_t retainedAdjustment = 0;
+    const auto retainedDescriptor = retained->Descriptor(address, bytes, retainedAdjustment);
+    const std::weak_ptr<HostImport> oldImport = HostImportFor(context, address, bytes);
+    CopyBuffer(context, recorder.Commands(), retainedDescriptor.buffer, retainedDescriptor.offset, readback.Handle(), 0, bytes);
     Require(sceKernelMapDirectMemory(&release.mappings[2], bytes, 3, 0x10, release.physical[1], bytes) == 0, "replace shared backing at the same address");
     const auto second = import();
     Require(HostImportSerial(context, address, bytes, false) != firstSerial, "a remap retained the old import identity");
+    const auto afterRetirement = retained->Descriptor(address, bytes, retainedAdjustment);
+    Require(afterRetirement.buffer == retainedDescriptor.buffer && afterRetirement.offset == retainedDescriptor.offset, "import retirement changed an already prepared buffer descriptor");
+    Require(!retained->DirectRegions().has_value(), "retired buffer was cacheable under its replacement import identity");
+    retained.reset();
+    Require(!oldImport.expired(), "retired import was freed before its GPU commands completed");
+    recorder.Sync();
     read(second, std::byte{0x77});
     Require(sceKernelMapDirectMemory(&release.mappings[2], bytes, 3, 0x10, release.physical[0] + bytes, bytes) == 0, "remap before a refused import");
     auto refused = context;
@@ -364,7 +378,7 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
     void* middle = original + bytes;
     Require(sceKernelMapDirectMemory(&middle, bytes, 3, 0x10, release.physical[1], bytes) == 0, "split the combined import across two backings");
     const auto combinedAddress = reinterpret_cast<std::uint64_t>(original);
-    const auto* narrow = HostImportFor(context, combinedAddress, bytes);
+    const auto narrow = HostImportFor(context, combinedAddress, bytes);
     Require(narrow != nullptr, "import the first fragment before combining it");
     const auto narrowBuffer = narrow->buffer;
     const auto narrowSerial = HostImportSerial(context, combinedAddress, bytes, false);
@@ -376,7 +390,7 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
         for (std::size_t i = 0; i < bytes * 3; ++i) Require(combinedReadback.Bytes()[i] == expected[i / bytes], "combined import read the wrong backing at a boundary");
     };
-    const auto* combined = HostImportFor(context, combinedAddress, bytes * 3);
+    const auto combined = HostImportFor(context, combinedAddress, bytes * 3);
     Require(combined != nullptr && combined->buffer != narrowBuffer, "a combined import reused an undersized buffer");
     Require(narrow->buffer == narrowBuffer, "combining ranges retired an existing overlapping import");
     Require(!narrow->shadowAllowed && !combined->shadowAllowed, "overlapping imports retained independent unit shadows");
@@ -400,7 +414,7 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
     }
     Require(std::all_of(static_cast<std::byte*>(release.mappings[1]), static_cast<std::byte*>(release.mappings[1]) + bytes, [](std::byte value) { return value == std::byte{0x99}; }), "combined GPU writes missed the second backing's alias");
     Require(sceKernelMapDirectMemory(&middle, bytes, 3, 0x10, release.physical[0] + bytes, bytes) == 0, "remap the middle of a combined import");
-    const auto* replaced = HostImportFor(context, combinedAddress, bytes * 3);
+    const auto replaced = HostImportFor(context, combinedAddress, bytes * 3);
     Require(replaced != nullptr && HostImportSerial(context, combinedAddress, bytes * 3, false) != combinedSerial, "middle remap retained the combined import identity");
     Require(narrow->buffer == narrowBuffer && narrow->serial == narrowSerial, "middle remap invalidated an unrelated fragment import");
     std::memset(original, 0x11, bytes);
@@ -408,6 +422,7 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
     readCombined(*replaced, {std::byte{0x11}, std::byte{0x55}, std::byte{0x33}});
 #endif
     std::cout << "Shared import roundtrip, direct binding, remap and failure recovery tests passed (" << (first.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "dma-buf" : "host pointer") << ")\n";
+    return oldImport;
 }
 
 void combinedShadowTests(const Device& device, Recorder& recorder) {
@@ -444,7 +459,7 @@ void combinedShadowTests(const Device& device, Recorder& recorder) {
         for (std::size_t i = 0; i < 3; ++i) mutation.Add(static_cast<std::byte*>(block) + i * bytes, bytes, true, true);
     }
     std::memset(block, 0x11, bytes * 3);
-    const auto* narrow = HostImportFor(context, address + bytes, bytes);
+    const auto narrow = HostImportFor(context, address + bytes, bytes);
     Require(narrow != nullptr, "import narrow shadow memory");
     if (!Watched(address + bytes, bytes)) {
         std::cout << "Imports unwatch memory: combined import shadow test skipped\n";
@@ -460,7 +475,7 @@ void combinedShadowTests(const Device& device, Recorder& recorder) {
     const ShadowedRange range{address + bytes, address + bytes * 2, destination->slab};
     MarkShadowed(*narrow, std::span(&range, 1), TrackerGeneration());
     Require(AnyShadowedOverlaps(address + bytes, bytes), "the narrow shadow was not pending");
-    const auto* combined = HostImportFor(context, address, bytes * 3);
+    const auto combined = HostImportFor(context, address, bytes * 3);
     Require(combined != nullptr && !combined->shadowAllowed && !narrow->shadowAllowed, "combined import retained competing shadows");
     Require(!AnyShadowedOverlaps(address, bytes * 3), "combining imports left an unpublished shadow");
     Require(!ShadowDestinationFor(context, *narrow, address + bytes, address + bytes * 2).has_value(), "old narrow resources can still make a competing shadow");
@@ -1154,7 +1169,7 @@ void storeRunTests(const Device& device, Recorder& recorder) {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, bytes, true, true);
     }
-    const auto* import = HostImportFor(context, address, bytes);
+    const auto import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
         std::cout << "host import of the store test block refused: store runs not tested\n";
         return;
@@ -1812,7 +1827,7 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
             mutation.Remove(block);
         }
     } unregister{block};
-    const auto* import = HostImportFor(context, address, bytes);
+    const auto import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
         std::cout << "host import of the shadow test block refused: unit shadows not tested\n";
         return;
@@ -2007,7 +2022,7 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
             HostImportFor(context, address, bytes);
         }
     } unregister{base, block, address};
-    const auto* import = HostImportFor(base, address, bytes);
+    const auto import = HostImportFor(base, address, bytes);
     if (import == nullptr) {
         std::cout << "host import of the storage refresh block refused: storage refresh not tested\n";
         return;
@@ -2168,7 +2183,7 @@ void importWatchTests(const Device& device) {
         BumpCollectEpoch();
         Require(CollectWrites(address, 2 * unit) != 0, "(u) the memoized collect of a watched block failed");
         registerRange(block, 2 * unit);
-        const auto* import = HostImportFor(context, address, 2 * unit);
+        const auto import = HostImportFor(context, address, 2 * unit);
         Require(import != nullptr && import->unwatched, "(u) an import made under the unwatch decision is not marked unwatched");
         Require(!Watched(address, 2 * unit) && !Watched(address + unit, 4096), "(u) an imported range stays watched");
         Require(CollectWrites(address, 2 * unit) == 0 && CollectWrites(address + 4096, 4096) == 0, "(u) a collect memoized before the import answers for the unwatched range");
@@ -2188,12 +2203,12 @@ void importWatchTests(const Device& device) {
         remap(block, 2 * unit);
         Require(Watched(address, 2 * unit), "(u) a remapped range is not watched");
         registerRange(block, 2 * unit);
-        const auto* kept = HostImportFor(context, address, 2 * unit);
+        const auto kept = HostImportFor(context, address, 2 * unit);
         Require(kept != nullptr && kept->unwatched && !Watched(address, 2 * unit) && CollectWrites(address, 2 * unit) == 0, "(u) an import kept over a remap left the range watched");
         unregisterRange(block);
         remap(block, 2 * unit);
         registerRange(block, unit);
-        const auto* again = HostImportFor(context, address, unit);
+        const auto again = HostImportFor(context, address, unit);
         Require(again != nullptr && again->unwatched && again->bytes == unit && !Watched(address, unit), "(u) a re-import after an unmap did not follow the decision");
         Require(Watched(address + unit, unit) && CollectWrites(address + unit, unit) != 0, "(u) the unregistered rest of a remapped range is not watched");
         unregisterRange(block);
@@ -2206,7 +2221,7 @@ void importWatchTests(const Device& device) {
         void* block = AllocateWatched(bytes, unit);
         const auto address = reinterpret_cast<std::uint64_t>(block);
         registerRange(block, bytes);
-        const auto* import = HostImportFor(context, address, bytes);
+        const auto import = HostImportFor(context, address, bytes);
         Require(import != nullptr && !import->unwatched && Watched(address, bytes), "(u) an import made under the watch decision left the watch");
         const auto generation = CollectWrites(address, bytes);
         Require(generation != 0 && UnchangedSince(address, bytes, generation), "(u) a watched import is not collected");
@@ -2296,7 +2311,7 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
         context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         image->MarkDirty();
-        const auto* import = HostImportFor(base, address, bytes);
+        const auto import = HostImportFor(base, address, bytes);
         if (import == nullptr) {
             std::cout << "host import of the stale generation block refused: a range leaving the watch not tested\n";
             recorder.Sync();
@@ -2545,7 +2560,7 @@ void importWindowTests(const Device& device, Recorder& recorder) {
         image->MarkDirty();
         const auto cached = CollectWritesUncached(address, surfaceBytes);
         Require(cached != 0 && UnchangedSince(address, surfaceBytes, cached), "(w) the cache's generation is not current before the import");
-        const auto* import = HostImportFor(base, address, bytes);
+        const auto import = HostImportFor(base, address, bytes);
         if (import == nullptr) {
             std::cout << "host import of the import window block refused: the import window not tested\n";
             recorder.Sync();
@@ -2679,7 +2694,7 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, address, bytes);
         }
     } unregister{context, block, address};
-    const auto* import = HostImportFor(context, address, bytes);
+    const auto import = HostImportFor(context, address, bytes);
     if (import == nullptr || import->address == 0) {
         std::cout << "host import of the occlusion counter block refused: occlusion counter dumps on the GPU not tested\n";
         return;
@@ -2852,7 +2867,7 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     Require(keysUncompressed(), "the DCC decompress left the keys compressed");
     Require(memoryHolds({0xff, 0xff, 0xff, 0xff}), "the DCC decompress did not store the 1111 value");
     {
-        const auto* import = HostImportFor(base, address, bytes);
+        const auto import = HostImportFor(base, address, bytes);
         Require(import != nullptr, "the metadata pass block lost its import");
         const auto commands = recorder.Commands();
         context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, color.dccAddress - import->base, keyCount, 0x20202020u);
@@ -3733,15 +3748,21 @@ int main(int argc, char** argv) {
         Device device;
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
+        if (argc == 2 && std::string_view(argv[1]) == "--shared-import-only") {
+            std::weak_ptr<HostImport> retired;
+            {
+                Recorder recorder(device.GetContext());
+                recorder.Activate();
+                retired = sharedImportTests(device, recorder);
+                combinedShadowTests(device, recorder);
+            }
+            Require(retired.expired(), "retired import survived its last resource and completed batch");
+            return 0;
+        }
         Recorder recorder(device.GetContext());
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
-            return 0;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--shared-import-only") {
-            sharedImportTests(device, recorder);
-            combinedShadowTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--depth-array-failure-only") {
