@@ -734,6 +734,57 @@ void metadataPassTests() {
     }
 }
 
+void cmaskPassTests() {
+    using namespace AgcDriver::Graphics;
+    Require(CmaskKeyBytes(3840, 2160) == 81920 && CmaskKeyBytes(1024, 512) == 4096 && CmaskKeyBytes(1025, 513) == 16384, "CMASK macroblock extent changed");
+    expectFailure([] { CmaskKeyBytes(0, 1); }, "invalid CMASK surface extent");
+    alignas(256) std::array<std::uint8_t, 4096> keys{};
+    const auto address = reinterpret_cast<std::uintptr_t>(keys.data());
+    auto queue = makeState();
+    queue.context[0x0] = 0;
+    queue.context[0x202] = 0xcc0020;
+    queue.context[0x31c] |= 0x2000;
+    queue.context[0x31f] = static_cast<std::uint32_t>(address >> 8u);
+    queue.context[0x398] = static_cast<std::uint32_t>(address >> 40u);
+    queue.context[0x323] = 0x11223344;
+    auto pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].cmaskAddress == address, "CMASK address was not decoded");
+    Require(DrawKeyCovers({RegisterBank::Context, 0x398}), "CMASK address extension is missing from the draw key");
+    const Context context{};
+    const auto texelsAre = [&](std::uint32_t value) {
+        for (std::size_t offset = 0; offset < colorMemory.size(); offset += 4) {
+            std::uint32_t texel = 0;
+            std::memcpy(&texel, colorMemory.data() + offset, 4);
+            if (texel != value) return false;
+        }
+        return true;
+    };
+    colorMemory.fill(std::byte{0x5a});
+    RunColorMetadataPass(context, *pass);
+    Require(texelsAre(0x11223344) && std::ranges::all_of(keys, [](auto key) { return key == 0xff; }), "CMASK clear was not materialized and expanded");
+    colorMemory.fill(std::byte{0x7b});
+    RunColorMetadataPass(context, *pass);
+    Require(texelsAre(0x7b7b7b7b), "expanded CMASK erased later draws");
+    keys.fill(0);
+    pass->targets[0].clearWords[0] = 0x55667788;
+    RunColorMetadataPass(context, *pass);
+    Require(texelsAre(0x55667788), "a repeated CMASK clear retained the previous frame");
+    keys.fill(0);
+    keys.back() = 0xff;
+    expectFailure([&] { RunColorMetadataPass(context, *pass); }, "mixed or unsupported per-block metadata");
+    Require(texelsAre(0x55667788) && keys.front() == 0 && keys.back() == 0xff, "a refused CMASK pass changed memory");
+    keys.fill(0x11);
+    expectFailure([&] { RunColorMetadataPass(context, *pass); }, "mixed or unsupported per-block metadata");
+    auto unsupported = queue;
+    unsupported.context[0x31c] |= 0x10000000;
+    expectFailure([&] { DecodeColorMetadataPass(unsupported); }, "CMASK with mipmaps");
+    unsupported = queue;
+    unsupported.context[0x398] |= 0x100;
+    expectFailure([&] { DecodeColorMetadataPass(unsupported); }, "invalid CMASK address extension");
+    queue.context[0x202] = 0xcc0010;
+    Require(DecodeState(queue).color.cmaskAddress == address, "normal rendering lost CMASK metadata");
+}
+
 void DepthClipTests() {
     auto queue = makeState();
     const auto direct = AgcDriver::Graphics::DecodeState(queue);
@@ -2037,6 +2088,7 @@ int main() {
         DisabledColorTests();
         CompactedExportTests();
         metadataPassTests();
+        cmaskPassTests();
         ShaderStageTests();
         PixelInputLayoutTests();
         InitialContextTests();
