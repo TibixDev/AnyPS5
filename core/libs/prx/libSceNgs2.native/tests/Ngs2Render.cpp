@@ -161,6 +161,41 @@ static bool PanInitThrows(const float* angles, float unitAngle, std::uint32_t nu
     return false;
 }
 
+static void TestPanDistance() {
+    const float angles[] = {315.0f, 45.0f, 0.0f, 270.0f, 90.0f, 225.0f, 135.0f};
+    for (const auto format : {1u, 2u, 6u, 8u}) {
+        const bool lfe = format > 2;
+        const auto speakers = lfe ? format - 1 : format;
+        Ngs2PanWork work{};
+        Require(sceNgs2PanInit(&work, lfe ? angles : nullptr, 360.0f, speakers) == SCE_NGS2_OK);
+        for (const auto distance : {0.0f, 0.25f, 0.44245338f, 0.75f, 1.0f}) {
+            const Ngs2PanParam params[] = {{77.4253159f, distance, 0.4f, 0.125f}, {257.4253159f, distance, 0.8f, 0.25f}};
+            float output[18];
+            std::fill_n(output, 18, -13.0f);
+            Require(sceNgs2PanGetVolumeMatrix(&work, params, 2, format, output + 1) == SCE_NGS2_OK);
+            Require(output[0] == -13.0f && output[2 * format + 1] == -13.0f);
+            for (std::uint32_t p = 0; p < 2; ++p) {
+                const auto* row = output + 1 + p * format;
+                float power = 0.0f;
+                for (std::uint32_t channel = 0; channel < format; ++channel) {
+                    if (lfe && channel == 3) {
+                        Require(row[channel] == params[p].lfe_level);
+                        continue;
+                    }
+                    Require(std::isfinite(row[channel]) && row[channel] >= 0.0f);
+                    if (distance < 1.0f) Require(row[channel] > 0.0f);
+                    if (distance == 0.0f) Require(Near(row[channel], params[p].fbw_level / std::sqrt(static_cast<float>(speakers))));
+                    power += row[channel] * row[channel];
+                }
+                Require(Near(power, params[p].fbw_level * params[p].fbw_level));
+            }
+        }
+        Require(PanThrows(work, Ngs2PanParam{0.0f, -0.01f, 1.0f, 0.0f}, format));
+        Require(PanThrows(work, Ngs2PanParam{0.0f, 1.01f, 1.0f, 0.0f}, format));
+        Require(PanThrows(work, Ngs2PanParam{0.0f, NAN, 1.0f, 0.0f}, format));
+    }
+}
+
 static void TestPan() {
     const float pi = 3.14159265f;
     const float half = std::sqrt(0.5f);
@@ -241,7 +276,7 @@ static void TestPan() {
     Require(sceNgs2PanGetVolumeMatrix(&work, &onLowest, 1, 6, out) == SCE_NGS2_OK);
     Require(Near(out[0] * out[0] + out[1] * out[1], 1.0f) && Near(out[2], 0.0f) && Near(out[4], 0.0f) && Near(out[5], 0.0f));
 
-    Require(PanThrows(work, Ngs2PanParam{0.0f, 0.5f, 1.0f, 0.0f}, 6) && PanThrows(work, Ngs2PanParam{NAN, 1.0f, 1.0f, 0.0f}, 6));
+    Require(PanThrows(work, Ngs2PanParam{0.0f, -0.5f, 1.0f, 0.0f}, 6) && PanThrows(work, Ngs2PanParam{NAN, 1.0f, 1.0f, 0.0f}, 6));
     Require(PanThrows(work, front, 4) && PanThrows(work, front, 2) && !PanThrows(work, front, 6));
     Require(PanInitThrows(nullptr, 360.0f, 5) && PanInitThrows(nullptr, 360.0f, 0) && PanInitThrows(surround71, 360.0f, 8));
     Require(PanInitThrows(nullptr, 0.0f, 2) && PanInitThrows(nullptr, NAN, 2));
@@ -480,6 +515,7 @@ int main() {
     TestErrorsAndInfo();
     TestPcmBlockEnd();
     TestPan();
+    TestPanDistance();
     TestPitchAndRepeat();
     TestSubmixerMatrix();
     TestSampleRate();
