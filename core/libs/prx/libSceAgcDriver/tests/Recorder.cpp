@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -32,6 +33,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -2781,6 +2783,96 @@ void depthArrayTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+void depthArrayGuestTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    SampleProgram depthProgram(context, recorder, SAMPLE_Depth_ARRAY_SPV);
+    SampleProgram stencilProgram(context, recorder, SAMPLE_Stencil_ARRAY_SPV, true);
+    for (const auto format : {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+        const bool stencil = format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        const VkExtent2D extent{129, 137};
+        const auto depthBytes = stencil ? 4u : 2u;
+        const auto depthStride = DepthSliceBytes(extent, depthBytes);
+        const auto stencilStride = DepthSliceBytes(extent, 1);
+        std::vector<std::byte> memory(3 * (depthStride + stencilStride) + 256);
+        const auto address = (reinterpret_cast<std::uint64_t>(memory.data()) + 255) & ~std::uint64_t{255};
+        DepthTarget target{address, stencil ? address + 3 * depthStride : 0, extent, format, 0.25f, 19};
+        struct Release {
+            const Context& context;
+            Recorder& recorder;
+            ~Release() { recorder.Sync(); ClearDepthSurfaces(context.device); }
+        } release{context, recorder};
+        RunDepthClearPass(context, {target, VK_IMAGE_ASPECT_DEPTH_BIT | (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)});
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = extent.width;
+        resource.height = extent.height;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kZ64KBX;
+        resource.dimension = TextureDimension::k2DArray;
+        resource.depthOrLastArray = 2;
+        resource.format = stencil ? 22 : 7;
+        const std::array<std::uint32_t, 8> words{};
+        const VkComponentMapping mapping{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+        const auto sample = [&](const GuestTextureResource& descriptor) {
+            auto texture = DepthSurfaceTexture(context, words, descriptor, mapping);
+            Require(texture != nullptr, "mixed depth array was not recognized");
+            return texture;
+        };
+        const auto writeCenter = [&](std::uint64_t base, std::uint32_t bytes, std::uint32_t layer, std::uint32_t value) {
+            const auto block = ThinBlockLayout(TextureTileMode::kZ64KBX, bytes);
+            const auto* equation = FindTextureSwizzleEquation(24, bytes);
+            Require(equation != nullptr, "missing depth swizzle equation");
+            const auto x = extent.width / 2;
+            const auto y = extent.height / 2;
+            const auto coordinates = x | (y << 12) | (layer << 24);
+            std::uint64_t offset = 0;
+            for (std::uint32_t bit = 0; bit < equation->bits.size(); ++bit) offset |= std::uint64_t{std::popcount(coordinates & equation->bits[bit]) & 1u} << bit;
+            offset += ((y / block[2]) * ((extent.width + block[1] - 1) / block[1]) + x / block[1]) * block[0];
+            const auto destination = base + layer * DepthSliceBytes(extent, bytes) + offset;
+            AgcDriver::GuestMemory::Write(destination, std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), bytes));
+        };
+        const auto depthValue = [&](float value) { return stencil ? std::bit_cast<std::uint32_t>(value) : static_cast<std::uint32_t>(value * 65535.0f); };
+        writeCenter(address, depthBytes, 1, depthValue(0.5f));
+        writeCenter(address, depthBytes, 2, depthValue(0.75f));
+        auto texture = sample(resource);
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 0), 0.25f, "mixed array lost its resident slice");
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 1), 0.5f, "mixed array did not detile guest layer one");
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.75f, "mixed array did not detile guest layer two");
+        Require(sample(resource) == texture, "unchanged mixed array was replaced");
+        writeCenter(address, depthBytes, 1, depthValue(0.875f));
+        Require(sample(resource) == texture, "guest write replaced the mixed array view");
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 1), 0.875f, "mixed array retained old guest bytes");
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.75f, "guest write changed an unrelated layer");
+        auto subset = resource;
+        subset.baseArray = 2;
+        auto subview = sample(subset);
+        expectRed(depthProgram.Red(subview->View(), subview->Layout(), 0), 0.75f, "guest-only subview lost its absolute slice swizzle");
+        if (stencil) {
+            auto plane = resource;
+            plane.baseAddress = target.stencilAddress;
+            plane.format = 5;
+            writeCenter(plane.baseAddress, 1, 1, 37);
+            writeCenter(plane.baseAddress, 1, 2, 59);
+            auto stencilTexture = sample(plane);
+            expectRed(stencilProgram.Red(stencilTexture->View(), stencilTexture->Layout(), 0, 0), 19, "mixed stencil array lost its resident slice");
+            expectRed(stencilProgram.Red(stencilTexture->View(), stencilTexture->Layout(), 0, 1), 37, "mixed stencil array lost guest layer one");
+            expectRed(stencilProgram.Red(stencilTexture->View(), stencilTexture->Layout(), 0, 2), 59, "mixed stencil array lost guest layer two");
+            expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 1), 0.875f, "guest stencil upload changed depth");
+        }
+        auto rendered = target;
+        rendered.address += 2 * depthStride;
+        if (stencil) rendered.stencilAddress += 2 * stencilStride;
+        rendered.clearDepth = 0.125f;
+        RunDepthClearPass(context, {rendered, VK_IMAGE_ASPECT_DEPTH_BIT});
+        Require(sample(resource) == texture, "rendering a guest layer replaced the mixed array view");
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0, 2), 0.125f, "mixed array ignored a newly rendered layer");
+        Require(sample(subset) == subview, "rendering replaced a guest-only subview");
+        expectRed(depthProgram.Red(subview->View(), subview->Layout(), 0), 0.125f, "guest-only subview ignored a newly rendered layer");
+    }
+}
+
 void minLodTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (!context.imageViewMinLod) {
@@ -3041,6 +3133,7 @@ int main(int argc, char** argv) {
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--depth-array-only") {
             depthArrayTests(device, recorder);
+            depthArrayGuestTests(device, recorder);
             std::cout << "Depth/stencil array sampling, subviews and refresh tests passed\n";
             return 0;
         }
@@ -3088,6 +3181,7 @@ int main(int argc, char** argv) {
         cmaskPassTests(device, recorder);
         depthClearPassTests(device, recorder);
         depthArrayTests(device, recorder);
+        depthArrayGuestTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
         sampleDumpTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
