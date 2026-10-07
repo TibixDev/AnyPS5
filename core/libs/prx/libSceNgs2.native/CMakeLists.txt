@@ -8,7 +8,7 @@ if(MINGW)
 endif()
 
 if(BUILD_TESTING)
-    foreach(ngs2Test IN ITEMS Render Atrac9 Filter Custom)
+    foreach(ngs2Test IN ITEMS Render Atrac9 Filter Custom Reverb UserFx)
         string(TOLOWER ${ngs2Test} testName)
         add_test_executable(ngs2_${testName}_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/Ngs2${ngs2Test}.cpp)
         target_include_directories(ngs2_${testName}_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/LibAtrac9/C/src)
