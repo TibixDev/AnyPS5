@@ -5,7 +5,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -50,6 +52,7 @@ struct ScanProfile {
     std::atomic<std::uint64_t> bytes{0};
     std::atomic<std::uint64_t> nanoseconds{0};
     std::atomic<std::uint64_t> memoHits{0};
+    std::atomic<std::uint64_t> cmaskHits{0};
     std::atomic<std::uint64_t> flushSyncs{0};
     std::atomic<std::uint64_t> gpuStores{0};
     // GPU stores whose range had a 4-byte unaligned head or tail (copied instead of filled).
@@ -91,7 +94,7 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
     }
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto& proofs = Proofs();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()));
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu CMASK reuse hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.cmaskHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()));
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -386,10 +389,45 @@ std::size_t CmaskKeyBytes(std::uint32_t width, std::uint32_t height) {
 
 bool CmaskIsClear(std::uint64_t metaAddress, std::size_t keyBytes) {
     Require(metaAddress != 0 && keyBytes != 0, "invalid CMASK metadata range");
+    struct Proof {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::uint64_t allocationGeneration = 0;
+        std::uint64_t writeGeneration = 0;
+        bool clear = false;
+    };
+    static thread_local std::array<Proof, 64> proofs;
+    static const bool reuse = std::getenv("APS5_NO_CMASK_CACHE") == nullptr;
+    GuestMemory::FlushGpuWrites(metaAddress, keyBytes);
+    const auto allocationGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto collected = reuse ? GuestMemory::CollectWrites(metaAddress, keyBytes) : 0;
+    auto& proof = proofs[((metaAddress >> 16u) ^ (metaAddress >> 8u) ^ keyBytes) % proofs.size()];
+    if (collected != 0 && proof.address == metaAddress && proof.bytes == keyBytes &&
+        proof.allocationGeneration == allocationGeneration && proof.writeGeneration != 0 &&
+        GuestMemory::UnchangedSince(metaAddress, keyBytes, proof.writeGeneration)) {
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(metaAddress), keyBytes, 256);
+        CountStore(Scans().cmaskHits);
+        return proof.clear;
+    }
     std::vector<std::uint8_t> keys(keyBytes);
     GuestMemory::Read(metaAddress, std::as_writable_bytes(std::span(keys)), 256);
+    const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Require((keys[0] == 0 || keys[0] == 0xff) && AllKeysEqual(keys.data(), keys.size(), keys[0]), "CMASK contains mixed or unsupported per-block metadata");
-    return keys[0] == 0;
+    if (ScanProfileEnabled()) CountScan(keyBytes, start);
+    bool stable = collected != 0 && allocationGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (stable) {
+        if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+                const auto pending = recorder->DescribePendingWrite(metaAddress, keyBytes);
+                stable = !pending.has_value() || pending->signaled;
+            }
+        } else {
+            stable = !Recorder::SnapshotWriteOverlaps(metaAddress, keyBytes);
+        }
+    }
+    const bool clear = keys[0] == 0;
+    proof = stable ? Proof{metaAddress, keyBytes, allocationGeneration, collected, clear} : Proof{};
+    return clear;
 }
 
 void MarkCmaskExpanded(std::uint64_t metaAddress, std::size_t keyBytes) {
