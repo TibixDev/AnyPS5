@@ -90,7 +90,6 @@ public:
     DepthSurface& operator=(const DepthSurface&) = delete;
 
     void Clear(const DepthClearPass& pass) {
-        ++version;
         auto* recorder = Recorder::Active();
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
@@ -101,8 +100,18 @@ public:
         const VkImageSubresourceRange range{pass.aspects, 0, 1, 0, 1};
         context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, access);
+        NoteWrite(pass.aspects);
         if (batch) batch->SubmitAndWait();
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    }
+
+    void NoteWrite(VkImageAspectFlags aspects) {
+        if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ++depthVersion;
+        if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ++stencilVersion;
+    }
+
+    std::uint64_t Version(VkImageAspectFlags aspect) const {
+        return aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? stencilVersion : depthVersion;
     }
 
     void ValidateSampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource) const {
@@ -157,7 +166,7 @@ public:
         std::vector<GuestDepthSlice> pending(slices.size());
         for (std::size_t i = 0; i < slices.size(); ++i) {
             if (slices[i] != nullptr) {
-                changed[i] = versions[i] != std::pair{slices[i]->image, slices[i]->version};
+                changed[i] = versions[i] != std::pair{slices[i]->image, slices[i]->Version(aspect)};
                 continue;
             }
             Require(resource.dccAddress == 0, "guest depth array layers with compression metadata are not implemented");
@@ -231,7 +240,7 @@ public:
         for (std::size_t i = 0; i < slices.size(); ++i) {
             if (!changed[i]) continue;
             if (slices[i] != nullptr) {
-                versions[i] = {slices[i]->image, slices[i]->version};
+                versions[i] = {slices[i]->image, slices[i]->Version(aspect)};
                 guest[i] = {};
             } else {
                 versions[i] = {};
@@ -245,9 +254,10 @@ public:
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    std::uint64_t version = 1;
 
 private:
+    std::uint64_t depthVersion = 1;
+    std::uint64_t stencilVersion = 1;
     struct SampledDepth {
         std::unique_ptr<DepthSurface> array;
         std::shared_ptr<Texture> texture;
@@ -295,12 +305,32 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         if (surface->context.device == context.device && sameSurface(surface->target, target)) {
-            ++surface->version;
             return surface->view;
         }
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
     return surfaces().back()->view;
+}
+
+void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target, VkImageAspectFlags aspects) {
+    if (aspects == 0) return;
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != context.device || !sameSurface(surface->target, target)) continue;
+        surface->NoteWrite(aspects);
+        return;
+    }
+    throw std::runtime_error("AGC graphics: recording a write to an unknown depth surface");
+}
+
+void NoteDepthSurfaceWrite(const Context& context, const State& state) {
+    if (!state.depth) return;
+    VkImageAspectFlags aspects = state.depthTest && state.depthWrite ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u;
+    const auto writesStencil = [](const VkStencilOpState& stencil) {
+        return stencil.writeMask != 0 && (stencil.failOp != VK_STENCIL_OP_KEEP || stencil.passOp != VK_STENCIL_OP_KEEP || stencil.depthFailOp != VK_STENCIL_OP_KEEP);
+    };
+    if (state.stencilTest && (writesStencil(state.stencilFront) || writesStencil(state.stencilBack))) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    NoteDepthSurfaceWrite(context, *state.depth, aspects);
 }
 
 void ClearDepthSurfaces(VkDevice device) {

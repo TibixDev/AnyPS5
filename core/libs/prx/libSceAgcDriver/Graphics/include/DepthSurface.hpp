@@ -12,6 +12,8 @@ namespace AgcDriver::Graphics {
 class Texture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
+void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target, VkImageAspectFlags aspects);
+void NoteDepthSurfaceWrite(const Context& context, const State& state);
 void RunDepthClearPass(const Context& context, const DepthClearPass& pass);
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
 void ClearDepthSurfaces(VkDevice device);
