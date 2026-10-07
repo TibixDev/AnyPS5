@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,9 +77,55 @@ void requireThickAddresses(const GuestTextureResource& resource, std::uint32_t b
     }
 }
 
+void verifySurfaceByteSizes() {
+    constexpr std::array modes{TextureTileMode::kLinear, TextureTileMode::kStandard256B, TextureTileMode::kStandard4KB, TextureTileMode::kStandard64KB, TextureTileMode::kZ64KBX, TextureTileMode::kS64KBX, TextureTileMode::kD64KBX, TextureTileMode::kR64KBX};
+    constexpr std::array dimensions{TextureDimension::k1D, TextureDimension::k2D, TextureDimension::k2DArray, TextureDimension::kCube, TextureDimension::k3D};
+    constexpr std::array formats{1u, 56u, 169u};
+    constexpr std::array extents{1u, 17u, 127u, 1024u};
+    constexpr std::array depths{1u, 6u, 17u, 64u};
+    constexpr std::array levels{1u, 2u, 7u, 16u};
+    std::mt19937 random(0x5face);
+    std::vector<std::pair<GuestTextureResource, std::uint64_t>> cases;
+    std::size_t rejected = 0;
+    for (unsigned i = 0; i < 4096; ++i) {
+        GuestTextureResource resource{};
+        resource.width = extents[random() % extents.size()];
+        resource.height = extents[random() % extents.size()];
+        resource.depthOrLastArray = depths[random() % depths.size()] - 1u;
+        resource.mipCount = levels[random() % levels.size()];
+        resource.format = formats[random() % formats.size()];
+        resource.tileMode = modes[random() % modes.size()];
+        resource.dimension = dimensions[random() % dimensions.size()];
+        std::uint64_t expected = 0;
+        try {
+            expected = DescribeSurface(resource).guestBytes;
+        } catch (const std::runtime_error& error) {
+            reject([&] { ComputeSurfaceSize(resource); }, error.what());
+            ++rejected;
+            continue;
+        }
+        cases.emplace_back(resource, expected);
+        Require(ComputeSurfaceSize(resource) == expected && ComputeSurfaceSize(resource) == expected, "surface byte-size cache changed a layout's size");
+    }
+    Require(cases.size() > 128 && rejected != 0, "surface byte-size cases missed cache replacement or rejected layouts");
+    std::shuffle(cases.begin(), cases.end(), random);
+    for (auto [resource, expected] : cases) {
+        resource.baseAddress = static_cast<std::uint64_t>(random()) << 16u;
+        resource.dccAddress = static_cast<std::uint64_t>(random()) << 12u;
+        resource.baseLevel = resource.lastLevel = resource.mipCount - 1u;
+        resource.baseArray = resource.depthOrLastArray;
+        resource.minLod = 256;
+        resource.allocatedMipCount = resource.mipCount;
+        resource.dstSelX = 7;
+        resource.dccAlphaOnMsb = true;
+        Require(DescribeSurface(resource).guestBytes == expected && ComputeSurfaceSize(resource) == expected, "surface byte-size cache confused a view with its allocation");
+    }
+}
+
 }
 
 void RunTextureTilingTests() {
+    verifySurfaceByteSizes();
     {
         const auto mips = ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 4, 2);
         Require(mips.size() == 2, "linear mip chain must contain the requested mip count");
