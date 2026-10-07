@@ -24,6 +24,7 @@ class Recorder;
 class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
+class VertexInputCache;
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -137,6 +138,7 @@ struct Context {
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    VertexInputCache* vertexInputs = nullptr;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
