@@ -1754,6 +1754,19 @@ void failedImportTests(const Device& device) {
     Require(rejectedImports == (multipleRanges ? 2 : 1), "unchanged multi-mapping span retried a failed import");
     read(2 * unit, 64);
     Require(rejectedImports == (multipleRanges ? 3 : 2), "partial cross-allocation failure disqualified another whole allocation");
+    for (unsigned i = 0; i < 128; ++i) {
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + 3 * unit, unit);
+        read(4, 64);
+        read(2 * unit - 4, 16);
+    }
+    Require(rejectedImports == (multipleRanges ? 3 : 2), "unrelated mapping changes retried failed imports");
+    for (unsigned i = 0; i < 2048; ++i) GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + 3 * unit, unit);
+    read(4, 64);
+    read(2 * unit - 4, 16);
+    Require(rejectedImports == (multipleRanges ? 3 : 2), "expired mapping history discarded current failed import owners");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, 64);
+    read(4, 64);
+    Require(rejectedImports == (multipleRanges ? 3 : 2), "range invalidation without replacement discarded current failed owners");
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
@@ -1815,6 +1828,52 @@ void importRangeBenchmark(const Device& device) {
         }
         std::ranges::sort(times);
         std::cout << "Failed import range " << bytes << " bytes: median " << times[4] << " ns, p95 pass " << times.back() << " ns\n";
+    }
+}
+
+void importMappingBenchmark(const Device& device) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    auto context = device.GetContext();
+    context.hostImportAlignment = 4096;
+    context.dmaBufImport = false;
+    sharedImportResolver = context.deviceProc;
+    context.deviceProc = rejectHostImport;
+    ClearHostImports(context.device);
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t count = 1024;
+    constexpr std::size_t lookups = 64;
+    void* memory = AllocateWatched(unit * count, unit);
+    Require(memory != nullptr, "import mapping benchmark requires watched memory");
+    {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t i = 0; i < count; ++i) mutation.Add(static_cast<std::byte*>(memory) + i * unit, unit, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        void* memory;
+        ~Cleanup() {
+            ClearHostImports(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                for (std::size_t i = 0; i < count; ++i) mutation.Remove(static_cast<std::byte*>(memory) + i * unit);
+            }
+            ReleaseWatched(memory, unit * count);
+        }
+    } cleanup{context, memory};
+    const auto base = reinterpret_cast<std::uintptr_t>(memory);
+    for (const auto period : {0u, 64u, 1u}) {
+        std::array<double, 9> times;
+        for (unsigned pass = 0; pass <= times.size(); ++pass) {
+            const auto started = std::chrono::steady_clock::now();
+            for (unsigned i = 0; i < 16384; ++i) {
+                if (period != 0 && i % period == 0) GuestAllocations::GuestAllocationsInvalidate_nid_postfix(base + (count - 1) * unit, unit);
+                Require(HostImportFor(context, base + (i % lookups) * unit, 256) == nullptr, "forced failed import succeeded");
+            }
+            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / 16384;
+        }
+        std::ranges::sort(times);
+        std::cout << "Import mappings " << count << ", failures " << lookups << ", change period " << period << ": median " << times[4] << " us/request, p95 pass " << times.back() << " us\n";
     }
 }
 
@@ -2374,6 +2433,13 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
         return;
     }
+    const auto importedSerial = HostImportSerial(context, address, bytes, false);
+    for (unsigned i = 0; i < 128; ++i) {
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + bytes, bytes);
+        Require(HostImportSerial(context, address, bytes, true) == importedSerial, "unrelated mapping change retired a current import");
+    }
+    for (unsigned i = 0; i < 2048; ++i) GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + bytes, bytes);
+    Require(HostImportSerial(context, address, bytes, true) == importedSerial, "expired mapping history retired current import owners");
     const auto element = address + 4096;
     constexpr std::size_t elementBytes = 1024;
     ShaderRecompiler::RecompileResult program;
@@ -4671,6 +4737,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-import-ranges") {
             importRangeBenchmark(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-import-mappings") {
+            importMappingBenchmark(device);
             return 0;
         }
         std::lock_guard gpu(GpuMutex());
