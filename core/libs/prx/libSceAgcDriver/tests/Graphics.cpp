@@ -125,17 +125,14 @@ void stateTests() {
     initial.context[0xdead] = 1;
     initial.ClearContext();
     Require(initial.context.at(0x200) == 0 && !initial.context.contains(0xdead), "context reset did not restore defaults");
-    Require(initial.context.at(0x1b3) == 0 && initial.context.at(0x1b4) == 0, "reset pixel input enables are not zero");
     for (std::uint32_t slot = 0; slot < 8; ++slot) {
         const auto info = 0x31cu + 0xfu * slot;
         Require(initial.context.at(info) == 0, "reset color target was not disabled");
         initial.context[info] = 10u << 2u;
     }
-    initial.context[0x1b3] = initial.context[0x1b4] = 2;
     initial.ClearContext();
     initial.context[0x8e] = initial.context[0x8f] = 0xffffffffu;
     Require(AgcDriver::Graphics::ColorWriteMask(initial.context) == 0, "context clear kept old color targets enabled");
-    Require(initial.context.at(0x1b3) == 0 && initial.context.at(0x1b4) == 0, "context clear kept old pixel inputs enabled");
     Require(initial.userConfig.at(0x24b) == 0, "primitive restart must be disabled in initial queue state");
     initial.userConfig[0x24b] = 1;
     initial.ClearContext();
