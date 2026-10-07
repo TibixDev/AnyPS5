@@ -305,7 +305,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (profile && resource.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, scanStart);
         return keys;
     };
-    if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    if (guestBytes == 0) guestBytes = ComputeSurfaceSize(resource);
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
@@ -597,7 +597,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     // Results other images hold over this memory reach it before the new image reads it: a hit's
     // Refresh flushes them, the constructor's upload does not, and a GPU-direct upload reads the
     // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
-    if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    if (guestBytes == 0) guestBytes = ComputeSurfaceSize(resource);
     if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
     // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
@@ -2461,7 +2461,7 @@ bool ShaderResources::precollectImages() {
             record.sampled = binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
             try {
                 record.resource = DecodeTextureResource(words);
-                record.guestBytes = DescribeSurface(record.resource).guestBytes;
+                record.guestBytes = ComputeSurfaceSize(record.resource);
                 record.generation = GuestMemory::CollectWrites(record.resource.baseAddress, static_cast<std::size_t>(record.guestBytes));
                 record.decoded = true;
                 if (record.sampled && !noRecords && words.size() == 8 && (binding.imageDepthCompare.empty() || !binding.imageDepthCompare.at(element))) {
@@ -2556,7 +2556,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components = ViewComponents(resource);
-            const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
+            const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : ComputeSurfaceSize(resource);
             std::shared_ptr<Texture> texture;
             if (record != nullptr && record->texture != nullptr) {
                 texture = fastTexture(*record);
@@ -2592,7 +2592,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         if (binding.imageShape.has_value() && !firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest storage texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
-        const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
+        const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : ComputeSurfaceSize(resource);
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));
@@ -2652,7 +2652,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
         try {
             const auto resource = DecodeTextureResource(words);
-            consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
+            consider(resource.format, resource.baseAddress, ComputeSurfaceSize(resource), binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
         } catch (const std::exception&) {
             // Stage B reports the bad descriptor.
         }

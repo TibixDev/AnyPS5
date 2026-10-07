@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include <string>
+#include <string_view>
+#include <functional>
 #include <algorithm>
 #include <bit>
 #include <cstddef>
@@ -405,6 +407,22 @@ SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
     geometry.layerBytes = geometry.guestBytes / geometry.layers;
     for (const auto& mip : geometry.mips) geometry.sliceLinearBytes = std::max(geometry.sliceLinearBytes, mip.linearOffset + mip.linearSize);
     return geometry;
+}
+
+std::uint64_t ComputeSurfaceSize(const GuestTextureResource& descriptor) {
+    using Key = std::array<std::uint32_t, 7>;
+    struct Entry {
+        Key key{};
+        std::uint64_t bytes = 0;
+    };
+    thread_local std::array<Entry, 128> entries;
+    const Key key{descriptor.width, descriptor.height, descriptor.depthOrLastArray, descriptor.mipCount, descriptor.format, static_cast<std::uint32_t>(descriptor.tileMode), static_cast<std::uint32_t>(descriptor.dimension)};
+    const auto hash = std::hash<std::string_view>{}({reinterpret_cast<const char*>(key.data()), sizeof(key)});
+    auto& entry = entries[hash % entries.size()];
+    if (entry.bytes != 0 && entry.key == key) return entry.bytes;
+    const auto bytes = DescribeSurface(descriptor).guestBytes;
+    entry = {key, bytes};
+    return bytes;
 }
 
 bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels) {
