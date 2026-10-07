@@ -227,8 +227,10 @@ private:
 using Kind = Recorder::ReadKind;
 
 PFN_vkGetDeviceProcAddr sharedImportResolver = nullptr;
+std::uint64_t rejectedImports = 0;
 
 VKAPI_ATTR VkResult VKAPI_CALL rejectHostPointer(VkDevice, VkExternalMemoryHandleTypeFlagBits, const void*, VkMemoryHostPointerPropertiesEXT*) {
+    ++rejectedImports;
     return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
 
@@ -1661,6 +1663,67 @@ private:
     static inline DescriptorUpdates* active = nullptr;
 };
 
+void failedImportTests(const Device& device) {
+    auto context = device.GetContext();
+    context.hostImportAlignment = 4096;
+    context.dmaBufImport = false;
+    sharedImportResolver = context.deviceProc;
+    context.deviceProc = rejectHostImport;
+    rejectedImports = 0;
+    ClearHostImports(context.device);
+    constexpr std::size_t unit = 65536;
+    void* block = AllocateWatched(3 * unit, unit);
+    Require(block != nullptr, "failed-import test requires watched memory");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, 2 * unit, true, true);
+        mutation.Add(static_cast<std::byte*>(block) + 2 * unit, unit, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        void* block;
+        ~Cleanup() {
+            ClearHostImports(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+                mutation.Remove(static_cast<std::byte*>(block) + 2 * unit);
+            }
+            ReleaseWatched(block, 3 * unit);
+        }
+    } cleanup{context, block};
+    const auto read = [&](std::size_t offset, std::size_t bytes) {
+        Require(HostImportFor(context, address + offset, bytes) == nullptr, "a rejected host pointer became imported");
+    };
+    read(4, 64);
+    Require(rejectedImports == 1, "first import did not reach the transport");
+    for (std::size_t i = 0; i < 100; ++i) read(i * 16, 64);
+    Require(rejectedImports == 1, "unchanged allocation retried a failed import");
+    read(2 * unit - 4, 16);
+    Require(rejectedImports == 2, "cross-allocation request reused a failure for a different span");
+    read(2 * unit, 64);
+    Require(rejectedImports == 3, "partial cross-allocation failure disqualified another whole allocation");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Add(block, 2 * unit, true, true);
+    }
+    read(4, 64);
+    Require(rejectedImports == 4, "replacement mapping retained the old transport decision");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(block, unit, true, true, [] {});
+    }
+    read(4, 64);
+    read(unit + 4, 64);
+    Require(rejectedImports == 6, "split mapping retained an allocation-wide failure");
+    ClearHostImports(context.device);
+    read(4, 64);
+    Require(rejectedImports == 7, "clearing imports retained a transport failure");
+    std::cout << "Import failures preserve allocation boundaries, replacement identities, protection splits and device-cache clearing\n";
+}
+
 void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
     DescriptorUpdates updates(context);
@@ -2017,11 +2080,18 @@ void drawBindingsBenchmark(const Device& device) {
     std::cout << "Draw binding benchmark: " << times[3] << " us/draw median, " << times.front() << " minimum, " << times.back() << " maximum, " << DeviceProcLookups() - lookups << " device lookups, checksum " << checksum << '\n';
 }
 
-void resourceBuildBenchmark(const Device& device, bool shaderData = false) {
+void resourceBuildBenchmark(const Device& device, bool shaderData = false, bool failedImports = false) {
     std::unique_lock gpu(GpuMutex());
     auto context = device.GetContext();
     context.hostImportAlignment = 0;
     context.dmaBufImport = false;
+    if (failedImports) {
+        sharedImportResolver = context.deviceProc;
+        context.deviceProc = rejectHostImport;
+        context.hostImportAlignment = 4096;
+        rejectedImports = 0;
+        ClearHostImports(context.device);
+    }
     DeviceFunctions functions;
     FillDeviceFunctions(context, functions);
     context.functions = &functions;
@@ -2037,12 +2107,26 @@ void resourceBuildBenchmark(const Device& device, bool shaderData = false) {
     constexpr std::size_t bytes = 16 * 65536;
     void* memory = AllocateWatched(bytes, 65536);
     Require(memory != nullptr, "resource benchmark requires watched memory");
+    if (failedImports) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(memory, bytes, true, true);
+    }
     struct Cleanup {
         Context& context;
         Recorder& recorder;
         void* memory;
-        ~Cleanup() { recorder.Sync(); ClearCachedTextures(context.device); ReleaseWatched(memory, bytes); }
-    } cleanup{context, recorder, memory};
+        bool registered;
+        ~Cleanup() {
+            recorder.Sync();
+            ClearCachedTextures(context.device);
+            if (registered) {
+                ClearHostImports(context.device);
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(memory);
+            }
+            ReleaseWatched(memory, bytes);
+        }
+    } cleanup{context, recorder, memory, failedImports};
     std::memset(memory, 0x71, bytes);
     const auto address = reinterpret_cast<std::uint64_t>(memory);
     for (const std::uint32_t inputBytes : {256u, 16384u}) {
@@ -2097,7 +2181,7 @@ void resourceBuildBenchmark(const Device& device, bool shaderData = false) {
             if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / 1024;
         }
         std::sort(times.begin(), times.end());
-        std::cout << (shaderData ? "Shader data batches (" : "Resource batches (") << inputBytes << " byte inputs, " << imageCount << " textures): median " << times[4] << " us/draw, p95 pass " << times[8] << " us/draw, minimum " << times[0] << " us, checksum " << checksum << '\n';
+        std::cout << (shaderData ? "Shader data batches (" : failedImports ? "Failed import batches (" : "Resource batches (") << inputBytes << " byte inputs, " << imageCount << " textures): median " << times[4] << " us/draw, p95 pass " << times[8] << " us/draw, minimum " << times[0] << " us, checksum " << checksum << '\n';
     }
     }
 }
@@ -4422,6 +4506,10 @@ int main(int argc, char** argv) {
             resourceBuildBenchmark(device, true);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-failed-imports") {
+            resourceBuildBenchmark(device, false, true);
+            return 0;
+        }
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
@@ -4441,6 +4529,10 @@ int main(int argc, char** argv) {
         }
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--failed-imports-only") {
+            failedImportTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-buffers-only") {
             copiedBufferResidencyTests(device, recorder);
             copiedBackingTests(device, recorder);
@@ -4513,6 +4605,7 @@ int main(int argc, char** argv) {
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
             return 0;
         }
+        failedImportTests(device);
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
