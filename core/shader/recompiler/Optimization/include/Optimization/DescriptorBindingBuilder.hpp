@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/BindingAllocator.hpp"
 #include "Recompiler.hpp"
+#include <cstdint>
 
 namespace ShaderRecompiler {
 
@@ -11,6 +12,7 @@ struct MaterializedBindings {
     std::vector<DescriptorBinding> bindings;
     std::vector<std::byte> pushConstants;
 };
+std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter);
 
 class DescriptorBindingBuilder {
 public:

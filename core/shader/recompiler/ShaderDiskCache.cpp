@@ -64,8 +64,8 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(RecompileResult) == 176, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 80, "DescriptorBinding changed: update the binding encoder");
-static_assert(sizeof(DescriptorBindingUsage) == 240, "DescriptorBindingUsage changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 160, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBindingUsage) == 304, "DescriptorBindingUsage changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 28, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
 static_assert(sizeof(CompiledShaderInfo) == 304, "CompiledShaderInfo changed: update the info encoder");
@@ -81,7 +81,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 120, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(ResourceSpecialization) == 72, "ResourceSpecialization changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16, "ResourceSpecialization::Buffer changed: update BuildKey");
-static_assert(sizeof(ResourceSpecialization::Image) == 44, "ResourceSpecialization::Image changed: update BuildKey");
+static_assert(sizeof(ResourceSpecialization::Image) == 48, "ResourceSpecialization::Image changed: update BuildKey");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
 #endif
 
@@ -250,8 +250,12 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.Usage().imageWritten);
     writer.Flags(binding.Usage().imageDepthCompare);
     writer.Flags(binding.Usage().imageAtomic);
+    writer.Flags(binding.Usage().imageAtomic64);
     writer.Flags(binding.Usage().bufferAtomic);
     writer.Flags(binding.Usage().bufferWritten);
+    writer.Flags(binding.samplerUnnormalized);
+    writer.Flags(binding.imageUnnormalized);
+    writer.Values(std::span<const std::uint32_t>(binding.Usage().imageSamplers));
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -270,8 +274,12 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(usage.imageWritten);
     reader.Flags(usage.imageDepthCompare);
     reader.Flags(usage.imageAtomic);
+    reader.Flags(usage.imageAtomic64);
     reader.Flags(usage.bufferAtomic);
     reader.Flags(usage.bufferWritten);
+    reader.Flags(binding.samplerUnnormalized);
+    reader.Flags(binding.imageUnnormalized);
+    reader.Values(usage.imageSamplers);
     binding.usage = std::make_shared<const DescriptorBindingUsage>(std::move(usage));
 }
 
@@ -404,9 +412,11 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.read);
         out.Value(image.written);
         out.Value(image.atomic);
+        out.Value(image.atomic64);
         out.Value(image.depthCompare);
         out.Value(image.cube);
         out.Value(image.r128);
+        out.Value(image.srgbDecode);
         out.Value(image.depthBits);
         out.Value(image.depthUnorm16);
         out.Value(image.packed);
@@ -422,6 +432,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(sampler.firstUsePc);
         out.Value(sampler.forcePointFiltering);
         out.Value(sampler.depthCompare);
+        out.Value(sampler.uses);
     });
     writer.List(info.sampledPairs, [](Writer& out, const SampledResourcePair& pair) {
         out.Value(pair.image);
@@ -494,9 +505,11 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.read);
         in.Value(image.written);
         in.Value(image.atomic);
+        in.Value(image.atomic64);
         in.Value(image.depthCompare);
         in.Value(image.cube);
         in.Value(image.r128);
+        in.Value(image.srgbDecode);
         in.Value(image.depthBits);
         in.Value(image.depthUnorm16);
         in.Value(image.packed);
@@ -507,11 +520,12 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.indirectSearchIterations);
         in.Values(image.indirectResources);
     });
-    reader.List(info.samplers, 10, [](Reader& in, SamplerResource& sampler) {
+    reader.List(info.samplers, 11, [](Reader& in, SamplerResource& sampler) {
         in.Value(sampler.source);
         in.Value(sampler.firstUsePc);
         in.Value(sampler.forcePointFiltering);
         in.Value(sampler.depthCompare);
+        in.Value(sampler.uses);
     });
     reader.List(info.sampledPairs, 12, [](Reader& in, SampledResourcePair& pair) {
         in.Value(pair.image);
@@ -818,6 +832,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.depthUnorm16);
         out.Value(image.packedFormat);
         out.Value(image.emulatedCompare);
+        out.Value(image.srgbDecode);
     });
     writer.Values(std::span<const std::uint32_t>(specialization.boundDescriptors));
     const auto& switches = switchKey();

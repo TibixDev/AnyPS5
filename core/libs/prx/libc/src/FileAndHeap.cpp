@@ -114,6 +114,33 @@ int APS5_VABI fclose_nid_postfix(FileStream* stream) {
     return 0;
 }
 
+int APS5_VABI fseek_nid_postfix(FileStream* stream, std::int64_t offset, int origin);
+
+FileStream* APS5_VABI _ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi_nid_postfix(const char* filename, int mode, int protection) {
+    static_cast<void>(protection);
+    constexpr int In = 0x01, Out = 0x02, Ate = 0x04, App = 0x08, Trunc = 0x10, Nocreate = 0x20, Noreplace = 0x40,
+        Binary = 0x80;
+    constexpr std::pair<int, const char*> modes[] = {
+        {In, "r"}, {Out, "w"}, {Out | Trunc, "w"}, {Out | App, "a"},
+        {In | Binary, "rb"}, {Out | Binary, "wb"}, {Out | Trunc | Binary, "wb"}, {Out | App | Binary, "ab"},
+        {In | Out, "r+"}, {In | Out | Trunc, "w+"}, {In | Out | App, "a+"},
+        {In | Out | Binary, "r+b"}, {In | Out | Trunc | Binary, "w+b"}, {In | Out | App | Binary, "a+b"}};
+    const int open = (mode & (In | Out | App | Trunc | Binary)) | ((mode & Nocreate) ? In : 0) | ((mode & App) ? Out : 0);
+    const char* openMode = nullptr;
+    for (const auto& [flags, text] : modes) if (flags == open) openMode = text;
+    if (!openMode) return nullptr;
+    if ((mode & Noreplace) && (open & Out)) {
+        if (auto* existing = fopen_nid_postfix(filename, "r")) {
+            fclose_nid_postfix(existing);
+            return nullptr;
+        }
+    }
+    auto* stream = fopen_nid_postfix(filename, openMode);
+    if (!stream || !(mode & Ate) || fseek_nid_postfix(stream, 0, SEEK_END) == 0) return stream;
+    fclose_nid_postfix(stream);
+    return nullptr;
+}
+
 size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, FileStream* stream) {
     auto* handle = GetNativeStream(stream);
     if (size == 0 || count == 0) return 0;
@@ -219,7 +246,11 @@ void* APS5_VABI calloc_nid_postfix(size_t count, size_t size) {
 }
 
 int APS5_VABI posix_memalign_nid_postfix(void** pointer, size_t alignment, size_t size) {
-    return ApplicationHeapPosixAlign_nid_no_patch(pointer, alignment, size);
+    if (!pointer || alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) return 22;
+    const int savedError = errno;
+    const int result = ApplicationHeapPosixAlign_nid_no_patch(pointer, alignment, size);
+    errno = savedError;
+    return result;
 }
 
 void* APS5_VABI bsearch_nid_postfix(const void* key, const void* base, size_t count,

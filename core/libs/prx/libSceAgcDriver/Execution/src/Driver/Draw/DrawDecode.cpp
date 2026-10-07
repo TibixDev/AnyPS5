@@ -17,7 +17,7 @@ void DrawProgram::Read(const QueueState& queue, const DrawProgramPlan& source) {
     std::fill_n(words.begin(), prefix, 0u);
     for (std::uint32_t i = 0; i < userCount; ++i) {
         Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, source.userDataBase + i);
-        words[prefix + i] = readRegister(queue.shader, source.userDataBase + i);
+        words[prefix + i] = readUserData(queue.shader, source.userDataBase + i);
     }
     wordCount = prefix + userCount;
     if (!source.merged) return;

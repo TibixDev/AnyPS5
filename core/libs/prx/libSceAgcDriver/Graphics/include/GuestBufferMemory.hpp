@@ -43,9 +43,11 @@ struct ImportProbe {
     std::uint32_t pages = 0;
     std::uint32_t writtenAtImport = 0;
     std::uint32_t writtenAfterSubmit = 0;
+    std::uint32_t writtenByCpu = 0;
 };
 
 ImportProbe ProbeImportWriteProtection(const Context& context);
+ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 

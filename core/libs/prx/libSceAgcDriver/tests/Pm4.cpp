@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -13,6 +14,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -20,6 +22,8 @@
 #endif
 #include <windows.h>
 #endif
+
+extern "C" int APS5_VABI sceKernelAvailableFlexibleMemorySize(size_t* size);
 
 namespace {
 
@@ -321,9 +325,13 @@ void testCopies() {
     execute(state, makePacket(0x50, {0x40000000, 0x44332211, 0, low(destination.data()), high(destination.data()), 6}));
     check(destination[0] == 0x44332211 && destination[1] == 0x00002211, "DMA_DATA byte fill failed");
     constexpr std::uint32_t cachePolicies = (1u << 13u) | (2u << 25u);
+    std::size_t flexibleBefore = 0;
+    check(sceKernelAvailableFlexibleMemorySize(&flexibleBefore) == 0, "cannot query flexible memory");
     const auto toGds = makePacket(0x50, {0x60100000 | cachePolicies, low(source.data()), high(source.data()), 0x100, 0, 16});
     check(!AgcDriver::Pm4::ResolveStore(toGds, state, 64).has_value(), "DMA_DATA to GDS resolved as a memory store");
     execute(state, toGds);
+    std::size_t flexibleAfter = 0;
+    check(sceKernelAvailableFlexibleMemorySize(&flexibleAfter) == 0 && flexibleAfter == flexibleBefore, "the GDS was charged to the flexible memory budget");
     execute(state, makePacket(0x50, {0x20100000, 0x104, 0, 0xfff8, 0, 8}));
     destination = {};
     execute(state, makePacket(0x50, {0x20000000 | cachePolicies, 0xfff8, 0, low(destination.data()), high(destination.data()), 8}));
@@ -740,6 +748,41 @@ void testConditionalSubmission() {
     check(results[13] == 0, "a rejected conditional submission executed a guarded packet");
 }
 
+std::vector<std::uint32_t> branch(std::uint32_t mode, std::uint32_t function, const std::vector<std::uint32_t>* first, const std::vector<std::uint32_t>* second) {
+    const auto address = [](const std::vector<std::uint32_t>* target) { return target ? reinterpret_cast<std::uintptr_t>(target->data()) : std::uintptr_t{0}; };
+    const auto size = [](const std::vector<std::uint32_t>* target) { return target ? static_cast<std::uint32_t>(target->size()) : 0u; };
+    return makePacket(0x3f, {mode | (function << 8u), 0, 0, 0, 0, 0, 0, static_cast<std::uint32_t>(address(first)), static_cast<std::uint32_t>(address(first) >> 32u), size(first), static_cast<std::uint32_t>(address(second)), static_cast<std::uint32_t>(address(second) >> 32u), size(second)});
+}
+
+void testBranchSubmission() {
+    static std::array<std::uint32_t, 4> results{};
+    static std::vector<std::uint32_t> first, second;
+    results.fill(0);
+    first = joinPackets({writeWord(results[0], 71)});
+    second = joinPackets({writeWord(results[1], 72)});
+    auto words = joinPackets({branch(1, 0, &first, nullptr), writeWord(results[2], 73)});
+    submitWords(words);
+    AgcDriverWaitIdle_nid_postfix();
+    check(results[0] == 71 && results[1] == 0 && results[2] == 73, "an always-taken if-then COND_INDIRECT_BUFFER did not run its buffer");
+    results.fill(0);
+    words = joinPackets({branch(2, 0, &first, &second), writeWord(results[2], 74)});
+    submitWords(words);
+    AgcDriverWaitIdle_nid_postfix();
+    check(results[0] == 71 && results[1] == 0 && results[2] == 74, "an always-taken if-then-else COND_INDIRECT_BUFFER ran the wrong buffer");
+    results.fill(0);
+    words = joinPackets({branch(1, 0, nullptr, nullptr), writeWord(results[2], 75)});
+    submitWords(words);
+    AgcDriverWaitIdle_nid_postfix();
+    check(results[2] == 75, "an empty COND_INDIRECT_BUFFER skipped the next packet");
+    for (const auto& [mode, function, text] : {std::tuple{1u, 3u, "with a comparison"}, std::tuple{0u, 0u, "invalid COND_INDIRECT_BUFFER mode"}}) {
+        results.fill(0);
+        words = joinPackets({writeWord(results[3], 1), branch(mode, function, &first, nullptr)});
+        expectFailure([&] { submitWords(words); }, text);
+        AgcDriverWaitIdle_nid_postfix();
+        check(results[0] == 0 && results[3] == 0, "a rejected COND_INDIRECT_BUFFER submission executed a packet");
+    }
+}
+
 void testPredicatedSubmission() {
     alignas(16) std::uint64_t flag[2] = {0, 0};
     alignas(16) std::array<std::uint32_t, 4> written{};
@@ -870,6 +913,14 @@ void testAsyncMemoryFailure() {
 
 }
 
+void testUnwrittenUserData() {
+    AgcDriver::Registers shader{{0x8c, 0x100}, {0x8d, 0}, {0x240, 0x200}};
+    check(AgcDriver::DriverDetail::readUserData(shader, 0x8c) == 0x100 && AgcDriver::DriverDetail::readUserData(shader, 0x240) == 0x200, "a written user data register was not read");
+    check(AgcDriver::DriverDetail::readUserData(shader, 0x8d) == 0, "a user data register written as zero was not read");
+    check(AgcDriver::DriverDetail::readUserData(shader, 0x95) == 0 && AgcDriver::DriverDetail::readUserData(shader, 0x241) == 0, "an unwritten user data register does not read zero");
+    expectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::readRegister(shader, 0x95)); }, "required shader register");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "failure") {
@@ -896,9 +947,11 @@ int main(int argc, char** argv) {
         testConditionalWrite();
         testConditionalWriteSubmission();
         testPredication();
+        testUnwrittenUserData();
         testDriverSubmission();
         testPredicatedSubmission();
         testConditionalSubmission();
+        testBranchSubmission();
         LibcRunShutdown_nid_postfix();
         std::puts("PM4 catalog, registers, state, memory, conditional execution and submission tests passed");
         return 0;

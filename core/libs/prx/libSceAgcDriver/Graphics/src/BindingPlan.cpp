@@ -47,6 +47,8 @@ BindingPlan::BindingPlan(const Context& context, std::span<const CompiledShader>
         const auto flags = VulkanStage(shader.stage);
         std::uint64_t stageBuffers = 0, stageSampled = 0, stageStorage = 0, stageSamplers = 0;
         const auto firstBuffer = buffers.size();
+        const auto firstBinding = bindings.size();
+        const auto firstSampler = samplers;
         std::int64_t shaderData = -1;
         for (std::size_t source = 0; source < shader.program->bindings.size(); ++source) {
             const auto& binding = shader.program->bindings[source];
@@ -92,7 +94,7 @@ BindingPlan::BindingPlan(const Context& context, std::span<const CompiledShader>
                 }
             } else {
                 const bool address = binding.role == Role::BdaPagetable || binding.role == Role::FaultBuffer;
-                if (!(address || binding.role == Role::GuestBuffers || binding.role == Role::ShaderData || binding.role == Role::FlattenedSrt)) Require(false, std::string("unsupported descriptor role ") + roleName(binding.role));
+                if (!(address || binding.role == Role::GuestBuffers || binding.role == Role::ShaderData || binding.role == Role::FlattenedSrt || binding.role == Role::Gds)) Require(false, std::string("unsupported descriptor role ") + roleName(binding.role));
                 if (binding.kind != Kind::StorageBuffer) Require(false, std::string("unsupported descriptor kind ") + kindName(binding.kind) + " for role " + roleName(binding.role) + ": only StorageBuffer is supported");
                 Require(!binding.readOnly, "read-only descriptors are unsupported because the recompiler emits no NonWritable decoration");
                 stageBuffers += binding.count;
@@ -116,16 +118,22 @@ BindingPlan::BindingPlan(const Context& context, std::span<const CompiledShader>
                     }
                 } else {
                     Require(binding.count == 1, "shader data and flattened SRT descriptors must not be arrays");
-                    if (!address) Require(!binding.guestDescriptor.empty(), "empty shader data descriptor");
+                    if (binding.role == Role::Gds) Require(binding.guestDescriptor.empty(), "invalid GDS descriptor contract");
+                    else if (!address) Require(!binding.guestDescriptor.empty(), "empty shader data descriptor");
                     if (binding.role == Role::ShaderData) shaderData = static_cast<std::int64_t>(buffers.size());
                     buffers.push_back({});
                 }
             }
+            Require(stageBuffers + stageSampled + stageStorage <= context.limits.maxPerStageResources, "shader descriptors exceed per-stage limits");
             layout.push_back(item.layout);
             layoutKey.insert(layoutKey.end(), {item.layout.binding, static_cast<std::uint32_t>(item.layout.descriptorType), item.layout.descriptorCount, flags});
             bindings.push_back(item);
         }
         for (auto index = firstBuffer; index < buffers.size(); ++index) buffers[index].dataAllocation = shaderData;
+        for (auto index = firstBinding; index < bindings.size(); ++index) {
+            bindings[index].firstSampler = firstSampler;
+            bindings[index].samplerCount = samplers - firstSampler;
+        }
     }
     if (!buffers.empty()) descriptorSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(buffers.size())});
     if (sampledImages != 0) descriptorSizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledImages});

@@ -252,22 +252,6 @@ target_link_libraries(agc_driver_draw_plan_tests PRIVATE libSceAgcDriver libkern
 set_target_properties(agc_driver_draw_plan_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_draw_plan_tests)
 
-add_test_executable(agc_driver_recompiler_tests EXCLUDE_FROM_ALL
-        tests/Recompiler.cpp
-)
-
-target_include_directories(agc_driver_recompiler_tests PRIVATE
-        ${LIBS_INCLUDE_DIR}
-)
-
-target_link_libraries(agc_driver_recompiler_tests PRIVATE
-        libSceAgcDriver
-        libc
-)
-
-set_target_properties(agc_driver_recompiler_tests PROPERTIES CXX_EXTENSIONS OFF)
-configure_windows_unwind(agc_driver_recompiler_tests)
-
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
@@ -333,6 +317,11 @@ add_test_executable(agc_structurizer_tests EXCLUDE_FROM_ALL tests/Structurizer.c
 target_link_libraries(agc_structurizer_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_structurizer_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_structurizer_tests)
+
+add_test_executable(agc_spirv_module_tests EXCLUDE_FROM_ALL tests/SpirvModule.cpp)
+target_link_libraries(agc_spirv_module_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_spirv_module_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_spirv_module_tests)
 
 add_test_executable(agc_dpp_write_tests EXCLUDE_FROM_ALL tests/DppWrite.cpp)
 target_link_libraries(agc_dpp_write_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -512,6 +501,7 @@ target_include_directories(agc_driver_pm4_tests PRIVATE
 target_link_libraries(agc_driver_pm4_tests PRIVATE
         libSceAgcDriver
         libc
+        libkernel
 )
 
 set_target_properties(agc_driver_pm4_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -575,6 +565,7 @@ target_include_directories(agc_driver_graphics_tests PRIVATE
 target_link_libraries(agc_driver_graphics_tests PRIVATE
         shader_recompiler_agc_driver
         libc
+        libkernel
 )
 
 set_target_properties(agc_driver_graphics_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -632,7 +623,7 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
 endforeach()
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_vertex_stage_tests agc_shared_write_tests agc_vertex_input_tests agc_driver_tests agc_driver_draw_plan_tests agc_shader_memory_tests agc_result_memo_tests agc_binding_materialization_tests agc_srt_execution_tests agc_structurizer_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests ${agcExecutionTests})
+    foreach(agcTest IN ITEMS agc_vertex_stage_tests agc_shared_write_tests agc_vertex_input_tests agc_driver_tests agc_driver_draw_plan_tests agc_shader_memory_tests agc_result_memo_tests agc_binding_materialization_tests agc_srt_execution_tests agc_structurizer_tests agc_spirv_module_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests ${agcExecutionTests})
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
@@ -904,6 +895,14 @@ if(BUILD_TESTING)
     add_test(NAME image_sample_gather COMMAND image_sample_gather_tests)
     if(WIN32)
         set_tests_properties(image_sample_gather PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(pixel_ancillary_tests ${LIBS_INCLUDE_DIR}/tests/PixelAncillary.cpp)
+    target_link_libraries(pixel_ancillary_tests PRIVATE shader_recompiler_agc_driver libc)
+    configure_windows_unwind(pixel_ancillary_tests)
+    add_test(NAME pixel_ancillary COMMAND pixel_ancillary_tests)
+    if(WIN32)
+        set_tests_properties(pixel_ancillary PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_indexed_draw_tests ${LIBS_INCLUDE_DIR}/tests/GuestIndexedDraw.cpp)

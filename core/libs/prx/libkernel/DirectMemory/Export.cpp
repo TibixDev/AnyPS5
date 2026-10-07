@@ -316,8 +316,7 @@ int APS5_VABI sceKernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 }
 
 int APS5_VABI sceKernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
- (void)type;
- return DoMprotect(addr, len, prot);
+ return DoMtypeprotect(addr, len, type, prot);
 }
 
 int APS5_VABI sceKernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot) {
@@ -426,8 +425,10 @@ int APS5_VABI sceKernelBatchMap2(KernelBatchMapEntry* entries, int num_entries, 
    result = sceKernelMunmap(reinterpret_cast<uint64_t>(entry.start), entry.length);
    break;
   case OpProtect:
-  case OpTypeProtect:
    result = DoMprotect(entry.start, entry.length, static_cast<uint8_t>(entry.protection));
+   break;
+  case OpTypeProtect:
+   result = DoMtypeprotect(entry.start, entry.length, static_cast<uint8_t>(entry.type), static_cast<uint8_t>(entry.protection));
    break;
   case OpMapFlexible:
    result = _mapFlexible(&entry.start, entry.length, static_cast<uint8_t>(entry.protection), flags);

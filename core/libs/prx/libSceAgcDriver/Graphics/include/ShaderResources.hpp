@@ -332,7 +332,7 @@ private:
     // Stage B: the record's texture when the fastRevalidate predicate proves it current under the
     // lock and the cache still holds it; null sends the element to cachedTexture.
     std::shared_ptr<Texture> fastTexture(const ImageRecord& record);
-    void resolveImageBinding(const ShaderRecompiler::DescriptorBinding& binding);
+    void resolveImageBinding(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::shared_ptr<Sampler>> shaderSamplers);
     void forgetDeferredInputs();
     void release() noexcept;
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
@@ -421,6 +421,7 @@ private:
     std::pmr::vector<bool> storageFirstLayer{std::pmr::polymorphic_allocator<bool>{&allocationArena}};
     std::pmr::vector<bool> storageWritten{std::pmr::polymorphic_allocator<bool>{&allocationArena}};
     std::pmr::vector<bool> storageAtomic{std::pmr::polymorphic_allocator<bool>{&allocationArena}};
+    std::pmr::vector<bool> storageAtomic64{std::pmr::polymorphic_allocator<bool>{&allocationArena}};
     std::pmr::vector<std::shared_ptr<Sampler>> samplers{&allocationArena};
     bool reusable = false;
     std::pmr::vector<DirectRegion> directRegions{&allocationArena};
@@ -442,7 +443,11 @@ private:
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),
     // the descriptor counts the set was sized for, and the compute stage of a deferred build.
     std::span<const Binding> bindings;
-    std::pmr::vector<const ShaderRecompiler::DescriptorBinding*> deferredImages{&allocationArena};
+    struct DeferredImage {
+        const ShaderRecompiler::DescriptorBinding* binding;
+        std::size_t index;
+    };
+    std::pmr::vector<DeferredImage> deferredImages{&allocationArena};
     // The compute constructor's shader and captured regions: the caller's objects, valid only until
     // the build (Complete() for a deferred one) is done, and reset then (forgetDeferredInputs).
     CompiledShader deferredCompute{};

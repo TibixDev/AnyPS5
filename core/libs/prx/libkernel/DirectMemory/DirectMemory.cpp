@@ -195,13 +195,13 @@ void ValidateRange(const void* addr, size_t len, size_t alignment) {
 }
 
 int LinuxProtFromSce(int prot) {
-    if ((prot & ~0xF7) != 0) {
+    if ((prot & ~0x3F7) != 0) {
         // return SCE_KERNEL_ERROR_EINVAL;
         throw std::invalid_argument("Unsupported memory protection bits: " + std::to_string(prot));
     }
     int result = PROT_NONE;
-    if (prot & 0x13) result |= PROT_READ;
-    if (prot & 0x22) result |= PROT_READ | PROT_WRITE;
+    if (prot & 0x113) result |= PROT_READ;
+    if (prot & 0x222) result |= PROT_READ | PROT_WRITE;
     if (prot & 4) result |= PROT_READ | PROT_EXEC;
     return result;
 }
@@ -653,6 +653,26 @@ void ValidateOutput(void** addr) {
 
 }
 
+bool Reserved(const void* addr, size_t len) {
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    const auto end = start + len;
+    std::lock_guard lock(g_reservationLock);
+    auto it = g_reservations.upper_bound(start);
+    if (it == g_reservations.begin()) return false;
+    auto cursor = start;
+    for (--it; it != g_reservations.end() && it->first <= cursor; ++it) {
+        cursor = std::max(cursor, it->second);
+        if (cursor >= end) return true;
+    }
+    return false;
+}
+
+bool FixedNoOverwriteConflict(const GuestAllocations::Mutation& mutation, void* addr, size_t len, int flags) {
+    constexpr int GuestMapNoOverwrite = 0x80;
+    if (addr == nullptr || (flags & GuestMapFixedFlag) == 0 || (flags & GuestMapNoOverwrite) == 0) return false;
+    return mutation.Overlaps(addr, len) && !Reserved(addr, len);
+}
+
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
@@ -660,6 +680,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
         return SCE_KERNEL_ERROR_EINVAL;
     }
     GuestAllocations::Mutation mutation;
+    if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
         EraseReservations(*addr, len);
         RecordProtection(*addr, len, prot);
@@ -688,6 +709,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
+    if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
         EraseReservations(*addr, len);
         RecordProtection(*addr, len, prot);
@@ -735,6 +757,33 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     });
     RecordProtection(pointer, bytes, prot);
     return 0;
+}
+
+int DoMtypeprotect(const void* addr, size_t len, int type, int prot) {
+    const int result = DoMprotect(addr, len, prot);
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    constexpr auto pageMask = static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1);
+    const auto first = address & ~pageMask;
+    const auto end = (address + len + pageMask) & ~pageMask;
+    std::vector<std::pair<std::uint64_t, std::size_t>> physical;
+    {
+        std::lock_guard lock(g_directLock);
+        auto it = g_directMappings.lower_bound(first);
+        if (it != g_directMappings.begin() && std::prev(it)->second.end > first) --it;
+        while (it != g_directMappings.end() && it->first < end) {
+            const auto base = it->first;
+            const auto mapping = it->second;
+            it = g_directMappings.erase(it);
+            if (base < first) g_directMappings.emplace(base, DirectMapping{first, mapping.phys, mapping.memoryType, mapping.backing});
+            const auto low = std::max(base, first);
+            const auto high = std::min(mapping.end, end);
+            g_directMappings.emplace(low, DirectMapping{high, mapping.phys + low - base, type, mapping.backing});
+            physical.emplace_back(mapping.phys + low - base, high - low);
+            if (mapping.end > end) it = g_directMappings.emplace(end, DirectMapping{mapping.end, mapping.phys + end - base, mapping.memoryType, mapping.backing}).first;
+        }
+    }
+    for (const auto& [phys, bytes] : physical) DirectMemoryRetype(static_cast<int64_t>(phys), bytes, type);
+    return result;
 }
 
 int DoMunmap(void* addr, size_t len) {

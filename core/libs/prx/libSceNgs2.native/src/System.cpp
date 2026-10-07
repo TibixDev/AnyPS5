@@ -15,7 +15,7 @@
 
 
 static std::vector<Ngs2System*>& Systems() {
-    static auto* systems = new std::vector<Ngs2System*>;
+    static auto* const systems = new std::vector<Ngs2System*>();
     return *systems;
 }
 
@@ -26,7 +26,7 @@ std::string Ngs2Hex(std::uint32_t value) {
 }
 
 std::recursive_mutex& Ngs2Mutex() {
-    static auto* mutex = new std::recursive_mutex;
+    static auto* const mutex = new std::recursive_mutex();
     return *mutex;
 }
 

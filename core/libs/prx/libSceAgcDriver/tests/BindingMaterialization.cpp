@@ -24,6 +24,9 @@ struct Fixture {
         info.buffers = {{.read = true}, {.written = true}, {.atomic = true}};
         info.images = {{.dimension = RdnaImageDimension::Dim2D, .read = true}, {.dimension = RdnaImageDimension::Dim2D, .atomic = true, .depthCompare = true}};
         info.samplers = {{.forcePointFiltering = true}, {.depthCompare = true}};
+        info.images[1].atomic64 = true;
+        info.samplers[0].uses = SamplerUseExplicitLod;
+        info.sampledPairs = {{0, 0, 0x10}};
         snapshot.buffers = {{{10,11,12,13},4}, {{20,21,22,23},4}, {{30,31,32,33},4}};
         snapshot.images = {{{40,41,42,43,44,45,46,47},8}, {{50,51,52,53,54,55,56,57},8}};
         snapshot.samplers = {{{60,61,0xffffffffu,63},4}, {{70,71,72,73},4}};
@@ -50,6 +53,8 @@ void materialization(bool push) {
     require(a.bindings[1].Usage().imageWritten == std::vector<bool>{true,false}, "image atomic write proof changed");
     require(a.bindings[1].Usage().imageDepthCompare == std::vector<bool>{true,false}, "image comparison metadata changed");
     require(a.bindings[1].Usage().imageAtomic == std::vector<bool>{true,false}, "image atomic metadata changed");
+    require(a.bindings[1].Usage().imageAtomic64 == std::vector<bool>{true,false}, "64-bit image atomic metadata changed");
+    require(a.bindings[1].Usage().imageSamplers == std::vector<std::uint32_t>{0,2}, "image-sampler mapping ignored binding order");
     require(a.bindings[1].imageShape == DescriptorImageShape::Image2D, "image shape changed");
     require(a.bindings[2].Usage().samplerDepthCompare == std::vector<bool>{true,false}, "sampler comparison metadata changed");
     require(a.bindings[0].guestDescriptor == std::vector<std::uint32_t>{30,31,32,33,10,11,12,13,20,21,22,23}, "buffer resource ordering changed");
@@ -78,6 +83,22 @@ void materialization(bool push) {
     require(a.bindings[0].Usage().bufferWritten == std::vector<bool>{true,false,true}, "retained draw lost reflection owner");
     rejects([&] { (void)f.Materialize(); });
 }
+void changingSamplerCoordinates() {
+    Fixture f(true);
+    auto normalized = f.Materialize();
+    f.snapshot.samplers[0].dwords[0] |= 1u << 15u;
+    auto unnormalized = f.Materialize();
+    require(normalized.bindings[1].imageUnnormalized == std::vector<bool>{false,false}, "retained image coordinate metadata changed");
+    require(normalized.bindings[2].samplerUnnormalized == std::vector<bool>{false,false}, "retained sampler coordinate metadata changed");
+    require(unnormalized.bindings[1].imageUnnormalized == std::vector<bool>{false,true}, "live image coordinate metadata not materialized");
+    require(unnormalized.bindings[2].samplerUnnormalized == std::vector<bool>{false,true}, "live sampler coordinate metadata not materialized");
+    require(normalized.bindings[1].usage == unnormalized.bindings[1].usage && normalized.bindings[2].usage == unnormalized.bindings[2].usage, "sampler change rebuilt immutable metadata");
+    f.builder.Populate(f.plan, f.info, IrShaderStage::Pixel, 16, f.snapshot, {5,6,7});
+    auto repeated = f.Materialize();
+    require(repeated.bindings[1].imageUnnormalized == unnormalized.bindings[1].imageUnnormalized && repeated.bindings[2].samplerUnnormalized == unnormalized.bindings[2].samplerUnnormalized, "rematerialization appended coordinate metadata");
+    f.snapshot.samplers[1].dwords[0] |= 1u << 15u;
+    rejects([&] { (void)f.Materialize(); });
+}
 void cacheRoundTrip() {
     Fixture f(true);
     CompiledVariant variant;
@@ -99,6 +120,7 @@ void cacheRoundTrip() {
         require(a.guestDescriptor == b.guestDescriptor && a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.imageShape == b.imageShape, "cached reflection changed descriptors");
         require(a.Usage().bufferWritten == b.Usage().bufferWritten && a.Usage().bufferAtomic == b.Usage().bufferAtomic && a.Usage().imageWritten == b.Usage().imageWritten && a.Usage().imageAtomic == b.Usage().imageAtomic && a.Usage().imageDepthCompare == b.Usage().imageDepthCompare && a.Usage().samplerDepthCompare == b.Usage().samplerDepthCompare, "cached reflection changed access metadata");
         require(decoded.bindings.bindings[i].guestDescriptor.empty(), "cached reflection retained live words");
+        require(a.Usage().imageAtomic64 == b.Usage().imageAtomic64 && a.Usage().imageSamplers == b.Usage().imageSamplers && a.samplerUnnormalized == b.samplerUnnormalized && a.imageUnnormalized == b.imageUnnormalized, "cached reflection lost merged image metadata");
     }
 }
 void malformed() {
@@ -127,6 +149,7 @@ int main() {
         materialization(false);
         malformed();
         cacheRoundTrip();
+        changingSamplerCoordinates();
         std::cout << "binding materialization tests passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

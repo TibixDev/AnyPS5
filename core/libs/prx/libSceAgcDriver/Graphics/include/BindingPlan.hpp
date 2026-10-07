@@ -26,6 +26,8 @@ public:
         ShaderRecompiler::DescriptorRole role;
         std::ranges::iota_view<std::size_t, std::size_t> allocations;
         std::ranges::iota_view<std::size_t, std::size_t> imageAllocations;
+        std::size_t firstSampler = 0;
+        std::size_t samplerCount = 0;
     };
     struct Buffer {
         bool written = true;

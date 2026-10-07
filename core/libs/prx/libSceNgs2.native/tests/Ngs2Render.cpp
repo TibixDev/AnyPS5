@@ -476,6 +476,85 @@ static void TestMasteringGain() {
     Require(sceNgs2SystemDestroy(loudSystem, nullptr) == SCE_NGS2_OK);
 }
 
+static uintptr_t RackVoice(uintptr_t rack, std::uint32_t index) {
+    uintptr_t voice = 0;
+    Require(sceNgs2RackGetVoiceHandle(rack, index, &voice) == SCE_NGS2_OK && voice != 0);
+    return voice;
+}
+
+static uintptr_t MasteringRack(uintptr_t system, std::uint32_t voices) {
+    Ngs2MasteringRackOption option{};
+    option.rack_option.size = sizeof(option);
+    option.rack_option.max_grain_samples = 512;
+    option.rack_option.max_voices = voices;
+    option.rack_option.max_input_delay_blocks = 1;
+    option.rack_option.max_matrices = 1;
+    option.rack_option.max_ports = 8;
+    option.max_channels = 8;
+    Ngs2ContextBufferInfo query{};
+    Require(sceNgs2RackQueryBufferSize(SCE_NGS2_RACK_ID_MASTERING, &option.rack_option, &query) == SCE_NGS2_OK);
+    const auto buffer = Buffer(query);
+    uintptr_t rack = 0;
+    Require(sceNgs2RackCreate(system, SCE_NGS2_RACK_ID_MASTERING, &option.rack_option, &buffer, &rack) == SCE_NGS2_OK && rack != 0);
+    return rack;
+}
+
+static void StereoSource(uintptr_t voice, const std::vector<std::int16_t>& pcm, uintptr_t master) {
+    Control(voice, SCE_NGS2_SAMPLER_VOICE_PARAM_SETUP, Ngs2SamplerVoiceSetupParam{{}, {SCE_NGS2_WAVEFORM_TYPE_PCM_I16L, 1, 48000, 0, 0, 0}});
+    const Ngs2WaveformBlock block{0, pcm.size() * sizeof(std::int16_t), 0, 0, static_cast<std::uint32_t>(pcm.size()), 0, 0};
+    Control(voice, SCE_NGS2_SAMPLER_VOICE_PARAM_ADD_WAVEFORM_BLOCKS, Ngs2SamplerVoiceWaveformBlocksParam{{}, pcm.data(), 0, 1, &block});
+    const float levels[2] = {1.0f, 0.5f};
+    Control(voice, SCE_NGS2_VOICE_PARAM_MATRIX_LEVELS, Ngs2VoiceMatrixLevelsParam{{}, 0, 2, levels});
+    Control(voice, SCE_NGS2_VOICE_PARAM_PORT_MATRIX, Ngs2VoicePortMatrixParam{{}, 0, 0});
+    Patch(voice, master);
+}
+
+static void TestStereoIntoSurround() {
+    const auto system = CreateSystem();
+    const auto masteringRack = MasteringRack(system, 3);
+    const auto samplerRack = CreateRack(system, SCE_NGS2_RACK_ID_SAMPLER);
+    uintptr_t masters[3];
+    for (std::uint32_t i = 0; i < 3; i++) {
+        masters[i] = RackVoice(masteringRack, i);
+        Control(masters[i], SCE_NGS2_MASTERING_VOICE_PARAM_SETUP, Ngs2MasteringVoiceSetupParam{{}, 2, 0});
+        Control(masters[i], SCE_NGS2_MASTERING_VOICE_PARAM_OUTPUT, Ngs2MasteringVoiceOutputParam{{}, i, 0});
+        Event(masters[i], SCE_NGS2_VOICE_EVENT_PLAY);
+    }
+    const std::vector<std::int16_t> pcm(Grain, 16384);
+    for (std::uint32_t i = 0; i < 2; i++) {
+        const auto source = RackVoice(samplerRack, i);
+        StereoSource(source, pcm, masters[i]);
+        Event(source, SCE_NGS2_VOICE_EVENT_PLAY);
+    }
+    std::vector<float> outFive(Grain * 6, -1.0f);
+    std::vector<float> outSeven(Grain * 8, -1.0f);
+    std::vector<float> outQuad(Grain * 4, -1.0f);
+    const Ngs2RenderBufferInfo info[3] = {
+        {outFive.data(), outFive.size() * sizeof(float), SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, 6},
+        {outSeven.data(), outSeven.size() * sizeof(float), SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, 8},
+        {outQuad.data(), outQuad.size() * sizeof(float), SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, 4},
+    };
+    Require(sceNgs2SystemRender(system, info, 3) == SCE_NGS2_OK);
+    for (std::uint32_t i = 0; i < Grain; i++) {
+        Require(outFive[i * 6] == 0.5f && outFive[i * 6 + 1] == 0.25f);
+        for (std::uint32_t channel = 2; channel < 6; channel++) Require(outFive[i * 6 + channel] == 0.0f);
+        Require(outSeven[i * 8] == 0.5f && outSeven[i * 8 + 1] == 0.25f);
+        for (std::uint32_t channel = 2; channel < 8; channel++) Require(outSeven[i * 8 + channel] == 0.0f);
+    }
+
+    const auto rejectedSource = RackVoice(samplerRack, 2);
+    StereoSource(rejectedSource, pcm, masters[2]);
+    Event(rejectedSource, SCE_NGS2_VOICE_EVENT_PLAY);
+    bool threw = false;
+    try {
+        sceNgs2SystemRender(system, info, 3);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw);
+    Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+}
+
 static void TestLock() {
     const auto system = CreateSystem();
     Require(sceNgs2SystemLock(0x1234) == SCE_NGS2_ERROR_INVALID_SYSTEM_HANDLE);
@@ -522,6 +601,12 @@ static void CheckExitOrder() {
     Require(sceNgs2SystemDestroy(exitSystem, nullptr) == SCE_NGS2_OK);
 }
 
+
+static void RenderAfterStaticTeardown() {
+    RenderI16(exitSystem);
+    Require(sceNgs2SystemDestroy(exitSystem, nullptr) == SCE_NGS2_OK);
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--exit-order") {
         Require(std::atexit(CheckExitOrder) == 0);
@@ -529,6 +614,7 @@ int main(int argc, char** argv) {
         exitVoice = Voice(CreateRack(exitSystem, SCE_NGS2_RACK_ID_SAMPLER));
         return 0;
     }
+    Require(std::atexit(RenderAfterStaticTeardown) == 0);
     TestErrorsAndInfo();
     TestPcmBlockEnd();
     TestPan();
@@ -538,7 +624,9 @@ int main(int argc, char** argv) {
     TestSampleRate();
     TestUserData();
     TestMasteringGain();
+    TestStereoIntoSurround();
     TestLock();
     TestAllocator();
+    exitSystem = CreateSystem();
     return 0;
 }
