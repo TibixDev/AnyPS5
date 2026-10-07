@@ -6,6 +6,7 @@
 #include <cstring>
 #include <array>
 #include <algorithm>
+#include <limits>
 #include <utility>
 #include <vector>
 #if defined(__linux__)
@@ -24,9 +25,58 @@ void reject(TAction action) {
     throw std::runtime_error("expected guest allocation ownership rejection");
 }
 
+void targetedLeaseTests() {
+    std::array<std::byte, 320> memory{};
+    const auto base = reinterpret_cast<std::uintptr_t>(memory.data());
+    using GuestAllocations::GuestAllocationsAcquireRange_nid_postfix;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(memory.data(), 64, true, true);
+        mutation.Add(memory.data() + 64, 64, true, false);
+        mutation.Add(memory.data() + 128, 64, false, false);
+        mutation.Add(memory.data() + 256, 64, true, true);
+    }
+    Require(GuestAllocationsAcquireRange_nid_postfix(0, 1).empty(), "a null address acquired a lease");
+    Require(GuestAllocationsAcquireRange_nid_postfix(base, 0).empty(), "an empty range acquired a lease");
+    Require(GuestAllocationsAcquireRange_nid_postfix(std::numeric_limits<std::uintptr_t>::max() - 1, 4).empty(), "an overflowing range acquired a lease");
+    Require(GuestAllocationsAcquireRange_nid_postfix(base - 1, 2).empty(), "a range before the allocation acquired a lease");
+    Require(GuestAllocationsAcquireRange_nid_postfix(base + 16, 49).empty(), "a lease crossed an allocation boundary");
+    Require(GuestAllocationsAcquireRange_nid_postfix(base + 128, 1).empty(), "unreadable memory acquired a lease");
+    Require(GuestAllocationsAcquireRange_nid_postfix(base + 192, 1).empty(), "an allocation gap acquired a lease");
+    Require(GuestAllocationsAcquireRange_nid_postfix(base + 320, 1).empty(), "a range past the allocation acquired a lease");
+    {
+        const auto readOnly = GuestAllocationsAcquireRange_nid_postfix(base + 64, 64);
+        Require(readOnly.size() == 1 && !readOnly.front()->writable, "a read-only lease lost its protection");
+        const auto lease = GuestAllocationsAcquireRange_nid_postfix(base + 16, 48);
+        Require(lease.size() == 1 && lease.front()->address == base && lease.front()->bytes == 64, "a subrange lease did not retain its containing allocation");
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(memory.data() + 256);
+        reject([&] { mutation.Remove(memory.data()); });
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(memory.data(), 64, false, false, [] {});
+    }
+    Require(GuestAllocationsAcquireRange_nid_postfix(base, 1).empty(), "a protection change left a readable lease");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(memory.data());
+        mutation.Add(memory.data(), 32, true, true);
+    }
+    Require(GuestAllocationsAcquireRange_nid_postfix(base, 32).size() == 1 && GuestAllocationsAcquireRange_nid_postfix(base, 33).empty(), "address reuse retained the previous allocation extent");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(memory.data());
+        mutation.Remove(memory.data() + 64);
+        mutation.Remove(memory.data() + 128);
+    }
+    Require(GuestAllocationsAcquireRange_nid_postfix(base, 1).empty(), "a removed allocation acquired a lease");
+}
+
 }
 
 void RunGuestAllocationTests() {
+    targetedLeaseTests();
     void* pointer = GuestHeap::GuestHeapAllocate_nid_postfix(32);
     Require(reinterpret_cast<std::uintptr_t>(pointer) % alignof(std::max_align_t) == 0, "guest malloc is not suitably aligned");
     std::memset(pointer, 0x55, 32);
