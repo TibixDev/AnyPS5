@@ -48,12 +48,13 @@ struct Mapping {
     std::uint64_t Address() const { return reinterpret_cast<std::uint64_t>(data); }
 };
 
-void benchmark() {
+void benchmark(bool labels = false) {
     require(WriteWatched(), "write tracking unavailable for benchmark");
     std::thread([] {}).join();
     Mapping mapping(2u << 20u);
     std::vector<std::byte> source(1u << 20u, std::byte{17});
-    for (const auto bytes : {std::size_t{4096}, std::size_t{65536}, std::size_t{1048576}}) {
+    const auto sizes = labels ? std::array<std::size_t, 3>{4, 8, 16} : std::array<std::size_t, 3>{4096, 65536, 1048576};
+    for (const auto bytes : sizes) {
         std::vector<double> times;
         std::uint64_t faults = 0;
         for (unsigned pass = 0; pass < 10; ++pass) {
@@ -65,7 +66,10 @@ void benchmark() {
             for (unsigned i = 0; i < 256; ++i) {
                 source[0] = static_cast<std::byte>(i);
                 BumpCollectEpoch();
-                Write(mapping.Address(), std::span(source).first(bytes), 1);
+                if (labels) {
+                    CheckRange(mapping.data, bytes, 4, true);
+                    StoreOwnBytes(mapping.Address(), std::span(source).first(bytes));
+                } else Write(mapping.Address(), std::span(source).first(bytes), 1);
             }
             const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / 256;
 #ifndef _WIN32
@@ -78,6 +82,35 @@ void benchmark() {
         std::sort(times.begin(), times.end());
         std::cout << "bytes=" << bytes << " median_us=" << times[4] << " faults=" << faults << " operations=2304\n";
     }
+}
+
+void smallStores() {
+    Mapping mapping(2u << 16u);
+    auto* data = static_cast<std::byte*>(mapping.data);
+    std::memset(data, 19, mapping.size);
+    std::array<std::byte, 16> source;
+    source.fill(std::byte{83});
+    for (const auto offset : {4u, 4092u, 65532u}) for (const auto size : {4u, 8u, 16u}) {
+        const auto address = mapping.Address() + offset;
+        const auto before = CollectWritesUncached(address, size);
+        const auto stored = StoreOwnBytes(address, std::span(source).first(size));
+        require(std::memcmp(data + offset, source.data(), size) == 0, "small backing store differs");
+        require(data[offset - 1] == std::byte{19} && data[offset + 16] == std::byte{19}, "small store changed neighboring bytes");
+        if (before != 0) {
+            require(stored > before && StoredOver(address, size, before), "small driver store was not stamped");
+            require(UnchangedSinceCollected(address, size, before), "driver store was classified as a guest write");
+            data[offset] = std::byte{97};
+            StoreOwnBytes(address, std::span(source).first(size));
+            require(!UnchangedSinceCollected(address, size, stored), "guest write before a driver store was lost");
+            const auto after = CollectWritesUncached(address, size);
+            data[offset] = std::byte{101};
+            require(!UnchangedSinceCollected(address, size, after), "guest write after a driver store was lost");
+        }
+    }
+    std::array<std::byte, 16> ordinary{};
+    StoreOwnBytes(reinterpret_cast<std::uintptr_t>(ordinary.data()), source);
+    require(ordinary == source, "small ordinary store fallback differs");
+    require(StoreOwnBytes(0, std::span<const std::byte>{}) == 0, "empty store produced a version");
 }
 
 template<class F> void fails(F&& fn) {
@@ -171,11 +204,13 @@ void run() {
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark") benchmark();
+        else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-labels") benchmark(true);
         else {
 #ifndef _WIN32
             const auto before = directMappings();
 #endif
             run();
+            smallStores();
 #ifndef _WIN32
             require(directMappings() == before, "physical backing write views leaked");
 #endif

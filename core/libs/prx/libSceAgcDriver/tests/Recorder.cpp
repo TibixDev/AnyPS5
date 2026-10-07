@@ -847,6 +847,49 @@ void completionCountTests(const Device& device, Recorder& recorder) {
     Require(memory[0] == 1 && memory[2] == (storeAlways ? 1u : 7u) && memory[16] == 1, "completion stores ran for the wrong labels (overlapped and not-imported ones store, the untouched GPU-stored one skips)");
 }
 
+void directCompletionLabelTests(Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t size = 65536;
+    struct Release {
+        Recorder& recorder;
+        void* mapping = nullptr;
+        std::int64_t physical = -1;
+        ~Release() {
+            recorder.Sync();
+            if (mapping != nullptr) sceKernelMunmap(mapping, size);
+            if (physical >= 0) sceKernelReleaseDirectMemory(physical, size);
+        }
+    } release{recorder};
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, size, size, 0, &release.physical) == 0, "allocate completion label backing");
+    Require(sceKernelMapDirectMemory(&release.mapping, size, 3, 0, release.physical, size) == 0, "map completion label backing");
+    auto* memory = static_cast<std::byte*>(release.mapping);
+    std::memset(memory, 7, size);
+    const auto address = reinterpret_cast<std::uint64_t>(memory) + 4092;
+    std::array<std::byte, 16> value;
+    for (const auto bytes : {4u, 8u, 16u}) {
+        value.fill(static_cast<std::byte>(bytes));
+        const auto before = CollectWritesUncached(address, bytes);
+        recorder.NotePendingWrite(address, bytes);
+        recorder.AfterCompletions(address, std::span(value).first(bytes), 100 + bytes, 0, false);
+        value.fill(std::byte{99});
+        bool observed = false;
+        Require(recorder.AfterRecordedWork([&] {
+            observed = std::all_of(memory + 4092, memory + 4092 + bytes, [bytes](auto b) { return b == static_cast<std::byte>(bytes); });
+        }), "completion observer was not recorded");
+        recorder.Sync();
+        Require(observed, "a following completion observed incorrect label bytes");
+        Require(memory[4091] == std::byte{7} && memory[4108] == std::byte{7}, "completion label changed neighboring bytes");
+        Require(recorder.Idle() && Recorder::PendingCompletionLabels() == 0, "completion label remained pending after sync");
+        if (before != 0) {
+            Require(StoredOver(address, bytes, before), "completion label was not stamped");
+            Require(UnchangedSinceCollected(address, bytes, before), "completion label dirtied the guest page");
+            const auto after = CollectWritesUncached(address, bytes);
+            memory[4092] = std::byte{81};
+            Require(!UnchangedSinceCollected(address, bytes, after), "completion store disabled subsequent guest tracking");
+        }
+    }
+}
+
 void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
     alignas(64) static std::uint32_t memory[16];
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -4649,6 +4692,16 @@ int main(int argc, char** argv) {
         }
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--completion-labels-only") {
+            completionCountTests(device, recorder);
+            afterRecordedWorkTests(device, recorder);
+            directCompletionLabelTests(recorder);
+            labelTests(recorder);
+            lateLabelTests(recorder);
+            largeLabelTests(recorder);
+            std::cout << "Completion label storage and ordering tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--failed-imports-only") {
             failedImportTests(device);
             return 0;
@@ -4730,6 +4783,7 @@ int main(int argc, char** argv) {
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
+        directCompletionLabelTests(recorder);
         batchStampTests(recorder);
         labelTests(recorder);
         lateLabelTests(recorder);
