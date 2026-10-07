@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string_view>
+#include <random>
 #include <type_traits>
 
 using namespace AgcDriver;
@@ -141,6 +143,174 @@ void testPlanLifetime() {
     check(workload.Size() == 352, "shape storage grew with unique runtime inputs");
 }
 
+DrawRegisterStateKey legacyRegisterStateKey(const QueueState& queue, bool allUserWords = false) {
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    std::uint64_t shapeKey = 0xcbf29ce484222325ull;
+    const auto mixKey = [&](std::uint64_t value) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    };
+    const auto mix = [&](std::uint64_t value) {
+        mixKey(value);
+        shapeKey ^= value;
+        shapeKey *= 0x100000001b3ull;
+    };
+    const auto userEnd = [&](std::uint32_t base) {
+        const auto resources = queue.shader.find(base - 1);
+        if (allUserWords) return base + 32u;
+        if (resources == queue.shader.end()) return base;
+        const auto count = ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
+        return base + std::min(count, 32u);
+    };
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 3> users{{{0x00cu, userEnd(0x00cu)}, {0x08cu, userEnd(0x08cu)}, {0x10cu, userEnd(0x10cu)}}};
+    const auto skipped = [&](std::uint32_t offset) {
+        for (const auto& [first, end] : users) {
+            if (offset >= first && offset < first + 32u) return offset >= end ? 2 : 1;
+        }
+        return offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u ? 1 : 0;
+    };
+
+    for (const auto& range : Graphics::DrawKeyRegisters) {
+        const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
+        mix((static_cast<std::uint64_t>(range.bank) << 32u) | range.first);
+        const auto end = range.first + range.count;
+        const bool shader = range.bank == Graphics::RegisterBank::Shader;
+        for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
+            const auto skip = shader ? skipped(it->first) : 0;
+            if (skip == 2) continue;
+            if (skip == 1) {
+                mixKey(it->first);
+                mixKey(it->second);
+                continue;
+            }
+            mix(it->first);
+            mix(it->second);
+        }
+    }
+    return {key, shapeKey};
+}
+
+void testFingerprints() {
+    static_assert(!std::is_convertible_v<Registers::Reference, std::uint32_t&>);
+    std::mt19937 random(42);
+    QueueState queue;
+    auto reference = legacyRegisterStateKey(queue);
+    auto tracked = RegisterStateKey(queue);
+    const auto compare = [&] {
+        const auto expected = legacyRegisterStateKey(queue);
+        const auto actual = RegisterStateKey(queue);
+        check(actual == RegisterStateKey(queue, false, false), "incremental fingerprint missed a mutation");
+        check(RegisterStateKey(queue, true) == RegisterStateKey(queue, true, false), "all-user fingerprint missed a mutation");
+        check((expected.exact == reference.exact) == (actual.exact == tracked.exact), "exact key changed its dependency set");
+        check((expected.shape == reference.shape) == (actual.shape == tracked.shape), "shape key changed its dependency set");
+        reference = expected;
+        tracked = actual;
+    };
+    for (const auto& range : Graphics::DrawKeyRegisters) {
+        auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
+        for (auto offset = range.first; offset < range.first + range.count; ++offset) {
+            bank.erase(offset); compare();
+            bank.emplace(offset, 0); compare();
+            bank.insert_or_assign(offset, 0); compare();
+            bank[offset] = random(); compare();
+            bank.at(offset) ^= 1; compare();
+        }
+    }
+    for (std::uint32_t i = 0; i < 30000; ++i) {
+        auto& bank = i % 3 == 0 ? queue.context : i % 3 == 1 ? queue.shader : queue.userConfig;
+        const auto offset = random() % 0x500;
+        switch (i % 11) {
+            case 0: bank.erase(offset); break;
+            case 1: bank.emplace(offset, random()); break;
+            case 2: bank[offset] |= random(); break;
+            case 3: bank[offset] &= random(); break;
+            case 4: {
+                auto retained = bank[offset];
+                bank.insert_or_assign(0x1000, random());
+                compare();
+                retained = random();
+                break;
+            }
+            case 5: {
+                auto copy = bank;
+                copy.insert_or_assign(offset, random());
+                compare();
+                bank = copy;
+                break;
+            }
+            default: bank.insert_or_assign(offset, random()); break;
+        }
+        compare();
+    }
+    queue.shader[0x8b] = 0; compare();
+    queue.shader[0x8c] = random(); compare();
+    queue.shader[0x8b] = 2; compare();
+    queue.shader[0x8b] = 1u << 27u; compare();
+    queue.shader.erase(0x8b); compare();
+    queue.savedContext = queue.context;
+    queue.ClearContext(); compare();
+    queue.context = *queue.savedContext; compare();
+    auto moved = std::move(queue.context);
+    check(queue.context.empty(), "moved register bank retained its population");
+    queue.context.emplace(0x200, 1); compare();
+    queue.context = std::move(moved); compare();
+    queue.context = queue.context; compare();
+    queue.context.clear(); compare();
+    queue.context.emplace(0x200, 0); compare();
+    queue = QueueState{}; compare();
+    Registers registers{{0, 7}, {64, 9}};
+    auto low = std::make_shared<const Registers::Mask>(std::vector<std::uint64_t>{1});
+    auto high = std::make_shared<const Registers::Mask>(std::vector<std::uint64_t>{0, 1});
+    const auto lowHash = registers.Fingerprint(low);
+    check(registers.Fingerprint(high) != lowHash && registers.Fingerprint(low) == lowHash, "projection switch reused another mask's hash");
+    registers[64] = 8;
+    check(registers.Fingerprint(low) == lowHash && registers.Fingerprint(high) == registers.RecomputeFingerprint(*high), "projection switch lost a masked write");
+}
+
+void benchmarkRegisterKeys() {
+    QueueState initial;
+    std::vector<std::pair<Graphics::RegisterBank, std::uint32_t>> offsets;
+    for (const auto& range : Graphics::DrawKeyRegisters) {
+        auto& bank = range.bank == Graphics::RegisterBank::Context ? initial.context : range.bank == Graphics::RegisterBank::Shader ? initial.shader : initial.userConfig;
+        for (auto offset = range.first; offset < range.first + range.count; ++offset) {
+            bank.emplace(offset, offset * 7919u);
+            offsets.emplace_back(range.bank, offset);
+        }
+    }
+    for (auto base : {0x00cu, 0x08cu, 0x10cu}) initial.shader[base - 1] = 16;
+    constexpr std::uint32_t count = 32768;
+    for (const auto writes : {0u, 1u, 16u, 64u, 256u}) {
+        std::array<double, 9> old{}, current{};
+        std::uint64_t checksum = 0;
+        const auto run = [&](bool incremental) {
+            auto queue = initial;
+            if (incremental) RegisterStateKey(queue);
+            const auto start = std::chrono::steady_clock::now();
+            for (std::uint32_t i = 0; i < count; ++i) {
+                for (std::uint32_t w = 0; w < writes; ++w) {
+                    const auto [kind, offset] = offsets[(i * 13u + w) % offsets.size()];
+                    auto& bank = kind == Graphics::RegisterBank::Context ? queue.context : kind == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
+                    bank.insert_or_assign(offset, i + w);
+                }
+                for (auto base : {0x00cu, 0x08cu, 0x10cu}) {
+                    queue.shader.insert_or_assign(base - 1, 16);
+                    for (std::uint32_t w = 0; w < 8; ++w) queue.shader.insert_or_assign(base + w, i + w);
+                }
+                const auto key = incremental ? RegisterStateKey(queue) : legacyRegisterStateKey(queue);
+                checksum += key.exact + key.shape;
+            }
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / count;
+        };
+        run(false); run(true);
+        for (std::size_t pass = 0; pass < old.size(); ++pass) {
+            if ((pass & 1u) == 0) { old[pass] = run(false); current[pass] = run(true); }
+            else { current[pass] = run(true); old[pass] = run(false); }
+        }
+        std::sort(old.begin(), old.end()); std::sort(current.begin(), current.end());
+        std::printf("Register keys, 24 live words + %u varying writes, 9 x %u: full %.6f us, incremental %.6f us; checksum %llu\n", writes, count, old[4], current[4], static_cast<unsigned long long>(checksum));
+    }
+}
+
 struct LegacyProgram : DrawProgramPlan {
     std::vector<std::uint32_t> userData;
 };
@@ -213,6 +383,8 @@ void benchmark() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc > 1 && std::string_view(argv[1]) == "--benchmark-registers") { benchmarkRegisterKeys(); return 0; }
+        testFingerprints();
         testInputs();
         testMergedInputs();
         testPlanLifetime();
