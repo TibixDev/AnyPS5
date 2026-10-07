@@ -765,8 +765,9 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
 std::optional<DepthClearPass> DecodeDepthClearPass(const QueueState& queue) {
     const auto& cx = queue.context;
     const auto control = find(cx, 0x000);
-    if (control == cx.end() || (control->second & 3u) == 0) return std::nullopt;
-    Require((control->second & ~0x2063u) == 0, "depth clear with copy, resummarize or decompress is unsupported");
+    if (control == cx.end()) return std::nullopt;
+    Require((control->second & ~0x2063u) == 0, "depth copy, resummarize or decompress is unsupported");
+    if ((control->second & 3u) == 0) return std::nullopt;
     Require(ColorWriteMask(cx) == 0, "depth clear with color writes is unsupported");
     zero(cx, 0x1c4, ~0u, "depth clear with shader depth or sample-mask export");
     zero(cx, 0x2f8, ~0u, "depth clear with multisampling or coverage conversion");
