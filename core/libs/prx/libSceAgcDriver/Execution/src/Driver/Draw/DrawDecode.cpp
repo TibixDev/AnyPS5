@@ -6,11 +6,12 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::readUserWords(const QueueState& queue, DrawProgram& program) {
+    program.userData.clear();
+    if (program.nullPixel) return;
     Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, program.resourceRegister);
-    const auto resources = program.nullPixel && !queue.shader.contains(program.resourceRegister) ? 0u : readRegister(queue.shader, program.resourceRegister);
+    const auto resources = readRegister(queue.shader, program.resourceRegister);
     const auto userCount = ((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u);
     require(userCount <= 32, "graphics user SGPR count exceeds the register bank");
-    program.userData.clear();
     for (std::uint32_t i = 0; i < userCount; ++i) {
         Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, program.userDataBase + i);
         program.userData.push_back(readRegister(queue.shader, program.userDataBase + i));
@@ -100,12 +101,13 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
         } else {
             append(0xc8, 2, Stage::Vertex, 0x8b, 0x8c, Role::Main);
         }
-        const bool nullPixel = Graphics::PixelProgramUnset(queue);
+        const bool nullPixel = Graphics::PixelProgramDisabled(queue);
         if (nullPixel) {
             const auto rejection = Graphics::NullPixelProgramRejection(queue);
             require(rejection.empty(), rejection.c_str());
         }
-        append(0x008, 1, Stage::Fragment, 0x00b, 0x00c, Role::Fragment);
+        programs.push_back(prepare(nullPixel ? 0u : programAddress(0x008), 1, Stage::Fragment, 0x00b, 0x00c));
+        roles.push_back(Role::Fragment);
         programs.back().firstUserSgpr = 0;
         product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(graphics), nullPixel);
         return product;

@@ -119,6 +119,7 @@ std::optional<DepthClearPass> DecodeDepthClearPass(const QueueState& queue);
 // pass (DecodeState still checks everything). A register a rule needs that is absent is no verdict.
 std::string DrawRejection(const QueueState& queue, bool indexed);
 bool PixelProgramUnset(const QueueState& queue);
+bool PixelProgramDisabled(const QueueState& queue);
 std::string NullPixelProgramRejection(const QueueState& queue);
 
 // The recording facade of the draw decoders (design_cpu_final M8, step 8a): every register read
