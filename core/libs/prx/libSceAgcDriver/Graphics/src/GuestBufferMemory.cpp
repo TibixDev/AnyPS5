@@ -124,8 +124,10 @@ struct HostImports {
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
-    std::map<std::uint64_t, HostImport> imports;
-    std::map<std::uint64_t, std::weak_ptr<const GuestAllocations::Range>> failed;
+    using Key = std::pair<std::uint64_t, std::uint64_t>;
+    std::map<Key, HostImport> imports;
+    std::map<Key, std::vector<std::weak_ptr<const GuestAllocations::Range>>> failed;
+    std::uint64_t maxImportBytes = 0;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
@@ -165,7 +167,7 @@ struct RetiredImport {
 // used it was synchronous and it is destroyed at once.
 const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
-void retireImport(const Context& context, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
+void retireImport(const Context& context, HostImports& state, std::map<HostImports::Key, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
@@ -228,18 +230,22 @@ int udmabufDevice() {
     return device;
 }
 
-const char* createDmaBufImport(const Context& context, HostImport& entry, int file, std::uint64_t offset, VkResult& failure) {
-    udmabuf_create request{};
-    request.memfd = static_cast<std::uint32_t>(file);
-    request.flags = UDMABUF_FLAGS_CLOEXEC;
-    request.offset = offset;
-    request.size = entry.bytes;
+const char* createDmaBufImport(const Context& context, HostImport& entry, const std::vector<GuestArena::SharedBackingSlice>& slices, VkResult& failure) {
+    if (slices.empty() || slices.size() > (std::numeric_limits<std::size_t>::max() - sizeof(udmabuf_create_list)) / sizeof(udmabuf_create_item) || slices.size() > std::numeric_limits<std::uint32_t>::max()) {
+        failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        return "dma-buf backing count";
+    }
+    const auto requestBytes = sizeof(udmabuf_create_list) + slices.size() * sizeof(udmabuf_create_item);
+    const std::unique_ptr<udmabuf_create_list, decltype(&std::free)> request(static_cast<udmabuf_create_list*>(std::malloc(requestBytes)), &std::free);
+    if (!request) throw std::bad_alloc();
+    request->flags = UDMABUF_FLAGS_CLOEXEC;
+    request->count = static_cast<std::uint32_t>(slices.size());
+    for (std::size_t i = 0; i < slices.size(); ++i) request->list[i] = {static_cast<std::uint32_t>(slices[i].file), 0, slices[i].offset, slices[i].bytes};
     const int device = udmabufDevice();
-    const int buffer = device < 0 ? -1 : ioctl(device, UDMABUF_CREATE, &request);
-    close(file);
+    const int buffer = device < 0 ? -1 : ioctl(device, UDMABUF_CREATE_LIST, request.get());
     if (buffer < 0) {
         failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-        return device < 0 ? "open /dev/udmabuf" : "UDMABUF_CREATE";
+        return device < 0 ? "open /dev/udmabuf" : "UDMABUF_CREATE_LIST";
     }
     VkMemoryFdPropertiesKHR properties{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
     if (const auto result = context.Function<PFN_vkGetMemoryFdPropertiesKHR>("vkGetMemoryFdPropertiesKHR")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buffer, &properties); result != VK_SUCCESS) {
@@ -259,9 +265,11 @@ const char* createDmaBufImport(const Context& context, HostImport& entry, int fi
 const char* createImport(const Context& context, HostImport& entry, VkResult& failure) {
     const char* step = createHostPointerImport(context, entry, failure);
 #ifndef _WIN32
-    int file = -1;
-    std::uint64_t offset = 0;
-    if (step != nullptr && context.dmaBufImport && GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), &file, &offset)) step = createDmaBufImport(context, entry, file, offset, failure);
+    struct Backings {
+        std::vector<GuestArena::SharedBackingSlice> slices;
+        ~Backings() { for (const auto& slice : slices) close(slice.file); }
+    } backings;
+    if (step != nullptr && context.dmaBufImport && GuestArena::GuestArenaSharedBackings_nid_no_patch(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), backings.slices)) step = createDmaBufImport(context, entry, backings.slices, failure);
 #endif
     return step;
 }
@@ -324,25 +332,26 @@ void decideImportWatch(const Context& context, HostImports& state) {
 #endif
 }
 
-std::shared_ptr<const GuestAllocations::Range> leasedRangeOwner(const GuestAllocations::Lease& lease, std::uint64_t base) {
-    const auto found = std::lower_bound(lease.begin(), lease.end(), base, [](const auto& range, std::uint64_t value) { return range->address < value; });
-    return found != lease.end() && (*found)->address == base ? *found : nullptr;
-}
-
-bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
-    const auto current = leasedRangeOwner(lease, entry.base);
-    return current != nullptr && !entry.range.owner_before(current) && !current.owner_before(entry.range);
+std::vector<std::weak_ptr<const GuestAllocations::Range>> importOwners(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    auto it = std::upper_bound(lease.begin(), lease.end(), begin, [](std::uint64_t value, const auto& range) { return value < range->address; });
+    if (it == lease.begin()) return {};
+    --it;
+    std::vector<std::weak_ptr<const GuestAllocations::Range>> result;
+    for (auto cursor = begin; cursor < end; ++it) {
+        if (it == lease.end() || (*it)->address > cursor || !(*it)->readable || cursor - (*it)->address >= (*it)->bytes) return {};
+        result.push_back(*it);
+        cursor = (*it)->address + (*it)->bytes;
+    }
+    return result;
 }
 
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
-    if (const auto found = state.imports.find(base); found != state.imports.end()) {
-        if (found->second.bytes == bytes && sameRange(found->second, lease)) return &found->second;
-        retireImport(context, state, found, lease);
-    }
+    const HostImports::Key key{base, bytes};
+    if (const auto found = state.imports.find(key); found != state.imports.end()) return &found->second;
     const auto alignment = context.hostImportAlignment;
-    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
-    const auto owner = std::lower_bound(lease.begin(), lease.end(), base, [](const auto& range, std::uint64_t address) { return range->address < address; });
-    Require(owner != lease.end() && (*owner)->address == base && (*owner)->bytes == bytes, "host import has no matching allocation lease");
+    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(key)) return nullptr;
+    auto owners = importOwners(lease, base, base + bytes);
+    if (owners.empty()) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
     // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
     // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
@@ -365,7 +374,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         return nullptr;
     }
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
-    entry.range = leasedRangeOwner(lease, base);
+    entry.ranges = std::move(owners);
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible.
     bool writable = true;
@@ -374,7 +383,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-            state.failed.emplace(base, *owner);
+            state.failed.emplace(key, entry.ranges);
             return nullptr;
         }
         const auto protection = info.Protect & 0xffu;
@@ -386,7 +395,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) {
-        state.failed.emplace(base, *owner);
+        state.failed.emplace(key, entry.ranges);
         return nullptr;
     }
     if (!writable) {
@@ -416,7 +425,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
-        state.failed.emplace(base, *owner);
+        state.failed.emplace(key, entry.ranges);
         std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -448,7 +457,19 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     std::uint64_t liveBytes = bytes;
     for (const auto& [address, existing] : state.imports) liveBytes += existing.bytes;
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok via %s (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), entry.dmaBuf ? "dma-buf" : "host pointer", state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
-    return &state.imports.emplace(base, entry).first->second;
+    GuestAllocations::Lease shadowLease;
+    for (auto& [existingKey, existing] : state.imports) {
+        if (base >= existing.base + existing.bytes || existing.base >= base + bytes) continue;
+        entry.shadowAllowed = false;
+        if (existing.shadowAllowed) {
+            if (shadowLease.empty()) shadowLease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            RetireShadow(context, existing, [&](std::uint64_t begin, std::uint64_t end) { return !importOwners(shadowLease, begin, end).empty(); });
+        }
+        existing.shadowAllowed = false;
+    }
+    if (entry.ranges.size() > 1) entry.shadowAllowed = false;
+    state.maxImportBytes = std::max(state.maxImportBytes, bytes);
+    return &state.imports.emplace(key, std::move(entry)).first->second;
 }
 
 // The lease is in address order (it is built from the registry map), so a range is found by binary search.
@@ -463,6 +484,33 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
     if (found == lease.begin()) return nullptr;
     const auto& range = *std::prev(found);
     return range->readable && begin >= range->address && end <= range->address + range->bytes ? range.get() : nullptr;
+}
+
+bool importOwnersCurrent(const std::vector<std::weak_ptr<const GuestAllocations::Range>>& owners, const GuestAllocations::Lease& lease) {
+    return std::all_of(owners.begin(), owners.end(), [&](const auto& weak) {
+        const auto owner = weak.lock();
+        return owner != nullptr && leasedRangeAt(lease, owner->address) == owner.get();
+    });
+}
+
+std::pair<std::uint64_t, std::uint64_t> importBounds(const Context& context, std::uint64_t begin, std::uint64_t end) {
+    const auto alignment = context.hostImportAlignment;
+    if (end % alignment != 0) {
+        const auto padding = alignment - end % alignment;
+        if (end > std::numeric_limits<std::uint64_t>::max() - padding) return {};
+        end += padding;
+    }
+    return {begin - begin % alignment, end};
+}
+
+const HostImport* importRange(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
+    if (const auto* range = containingRange(lease, begin, end)) return importAllocation(context, state, range->address, range->bytes, lease);
+#ifdef _WIN32
+    return nullptr;
+#else
+    const auto [first, last] = importBounds(context, begin, end);
+    return first < last ? importAllocation(context, state, first, last - first, lease) : nullptr;
+#endif
 }
 
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
@@ -480,6 +528,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         }
         state.imports.clear();
         state.failed.clear();
+        state.maxImportBytes = 0;
         state.device = context.device;
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
         state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
@@ -490,30 +539,30 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (generation == state.refreshedGeneration) return;
     state.refreshedGeneration = generation;
     for (auto it = state.imports.begin(); it != state.imports.end();) {
-        const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && range->bytes == it->second.bytes && sameRange(it->second, lease)) {
-            if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
+        if (importOwnersCurrent(it->second.ranges, lease)) {
+            if (it->second.unwatched) GuestMemory::Unwatch(it->second.base, it->second.bytes);
             ++it;
             continue;
         }
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
-        if (trace && range != nullptr && range->bytes == it->second.bytes) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
+        if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: its mapped owners changed\n", static_cast<unsigned long long>(it->first.first), static_cast<unsigned long long>(it->first.second));
         const auto next = std::next(it);
         retireImport(context, state, it, lease);
         it = next;
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) {
-        const auto* range = leasedRangeAt(lease, it->first);
-        it = range != nullptr && range == it->second.lock().get() ? std::next(it) : state.failed.erase(it);
+        it = importOwnersCurrent(it->second, lease) ? std::next(it) : state.failed.erase(it);
     }
 }
 
-const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
-    auto found = state.imports.upper_bound(begin);
-    if (found == state.imports.begin()) return nullptr;
-    --found;
-    const auto& entry = found->second;
-    return begin >= entry.base && end <= entry.base + entry.bytes ? &entry : nullptr;
+HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    auto found = state.imports.upper_bound({begin, std::numeric_limits<std::uint64_t>::max()});
+    while (found != state.imports.begin()) {
+        auto& entry = (--found)->second;
+        if (begin - entry.base >= state.maxImportBytes) break;
+        if (end <= entry.base + entry.bytes) return &entry;
+    }
+    return nullptr;
 }
 
 // Whether the imports need reconciling before a lookup: the registry changed since the last walk.
@@ -1299,17 +1348,16 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) return entry;
-        const auto lease = GuestAllocations::GuestAllocationsAcquireRange_nid_no_patch(address, bytes);
+        const auto [first, last] = importBounds(context, address, address + bytes);
+        const auto lease = first < last ? GuestAllocations::GuestAllocationsAcquireSpan_nid_no_patch(first, last - first) : GuestAllocations::Lease{};
         if (!importsStale(context, state)) {
-            if (lease.empty()) return nullptr;
-            const auto& range = *lease.front();
-            return importAllocation(context, state, range.address, range.bytes, lease);
+            return importRange(context, state, address, address + bytes, lease);
         }
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
-    return nullptr;
+    if (const auto* entry = findImport(state, address, address + bytes)) return entry;
+    return importRange(context, state, address, address + bytes, lease);
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
@@ -2154,12 +2202,14 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry == nullptr) {
                 GuestAllocations::Lease targeted;
                 const bool haveLease = !lease.empty() || space != nullptr || !acquired.empty();
-                if (!haveLease) targeted = GuestAllocations::GuestAllocationsAcquireRange_nid_no_patch(region.begin, bytes);
+                if (!haveLease) {
+                    const auto [first, last] = importBounds(context, region.begin, region.end);
+                    if (first < last) targeted = GuestAllocations::GuestAllocationsAcquireSpan_nid_no_patch(first, last - first);
+                }
                 const bool stale = importsStale(context, state);
                 const auto& available = haveLease || stale ? importRanges() : targeted;
                 if (stale) refreshImports(context, state, available);
-                if (const auto* range = containingRange(available, region.begin, region.end))
-                    entry = importAllocation(context, state, range->address, range->bytes, available);
+                entry = importRange(context, state, region.begin, region.end, available);
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
@@ -2755,16 +2805,14 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     // An import whose registered range changed must not be reused: reconcile first, as an upload
     // does (the walk only runs when the registry changed since the last one).
     if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) static_cast<void>(refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix()));
-    auto found = state.imports.upper_bound(address);
-    if (found == state.imports.begin()) return 0;
-    --found;
-    auto& entry = found->second;
-    if (address < entry.base || address + bytes > entry.base + entry.bytes) return 0;
+    if (state.device != context.device) return 0;
+    auto* entry = findImport(state, address, address + bytes);
+    if (entry == nullptr) return 0;
     // Serials are handed out on first use: a fresh import starts at 0, so one made after an earlier
     // import of the same range was dropped can never repeat that import's serial.
     static std::uint64_t serials = 0;
-    if (entry.serial == 0) entry.serial = ++serials;
-    return entry.serial;
+    if (entry->serial == 0) entry->serial = ++serials;
+    return entry->serial;
 }
 
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof) {

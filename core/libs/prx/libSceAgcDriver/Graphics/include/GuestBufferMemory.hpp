@@ -31,8 +31,9 @@ struct HostImport {
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
+    bool shadowAllowed = true;
+    std::vector<std::weak_ptr<const GuestAllocations::Range>> ranges;
     bool dmaBuf = false;
-    std::weak_ptr<const GuestAllocations::Range> range;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
