@@ -1495,6 +1495,82 @@ void pushConstantTests() {
     expectFailure([&] { AgcDriver::Graphics::AssemblePushConstants(shaders); }, "missing compiled shader");
 }
 
+void bindingPlanTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.limits.maxPerStageDescriptorSampledImages = 16;
+    context.limits.maxDescriptorSetSampledImages = 16;
+    context.limits.maxPerStageDescriptorSamplers = 16;
+    context.limits.maxDescriptorSetSamplers = 16;
+    BindingPlanCache cache(context, 2);
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    vertex.variantId = 1;
+    fragment.variantId = 2;
+    vertex.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32))));
+    vertex.bindings.front().bufferWritten = {false, true};
+    vertex.bindings.front().bufferAtomic = {false, true};
+    vertex.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, {7, 8, 9}));
+    fragment.bindings.push_back(makeBinding(Role::FlattenedSrt, 43, 1, {1, 2}));
+    std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 8}}};
+    const auto first = cache.Get(shaders);
+    Require(first->bindings.size() == 3 && first->buffers.size() == 4, "binding plan lost array elements");
+    Require(first->bindings[0].allocations[0] == 0 && first->bindings[0].allocations[1] == 1 && first->bindings[1].allocations.front() == 2, "binding plan allocation ranges overlap");
+    Require(first->buffers[0].dataAllocation == 2 && !first->buffers[0].written && first->buffers[1].written && first->buffers[1].atomic, "binding plan lost shader data offsets or access flags");
+    vertex.bindings.front().guestDescriptor = join(vsharp(guestThird.data(), 8), vsharp(guestFirst.data(), 16));
+    vertex.bindings[1].guestDescriptor = {10, 11, 12};
+    Require(cache.Get(shaders) == first, "live addresses or constants replaced the binding plan");
+    vertex.variantId = 3;
+    vertex.pushConstants.resize(8);
+    shaders.front().pushConstantOffset = 16;
+    const auto pushed = cache.Get(shaders);
+    Require(pushed != first && pushed->buffers[0].pushByte == 16 && pushed->buffers[1].pushByte == 17, "push patch positions were reused across incompatible plans");
+    shaders.front().pushConstantOffset = 24;
+    Require(cache.Get(shaders)->buffers[0].pushByte == 24 && cache.Size() == 2, "binding plan cache ignored push offsets or its capacity");
+    Require(first->buffers[0].pushByte == -1 && first->bindings[2].layout.binding == 43, "eviction invalidated a retained binding plan");
+    vertex.variantId = 0;
+    const auto uncached = cache.Get(shaders);
+    vertex.bindings[1].binding = 6;
+    Require(cache.Get(shaders) != uncached && cache.Get(shaders)->bindings[1].layout.binding == 6, "unknown shader variants reused a stale layout");
+    ShaderRecompiler::RecompileResult images;
+    auto sampled = makeBinding(Role::GuestImages, 1, 2, std::vector<std::uint32_t>(16));
+    sampled.kind = Kind::SampledImage;
+    sampled.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    images.bindings.push_back(sampled);
+    auto sampler = makeBinding(Role::GuestSamplers, 4, 1, std::vector<std::uint32_t>(4));
+    sampler.kind = Kind::Sampler;
+    sampler.samplerDepthCompare = {false};
+    images.bindings.push_back(sampler);
+    sampled.binding = 7;
+    images.bindings.push_back(sampled);
+    const CompiledShader imageShader{ShaderRecompiler::ShaderStage::Fragment, &images, 0};
+    const auto imagePlan = cache.Get(std::span(&imageShader, 1));
+    Require(imagePlan->sampledImages == 4 && imagePlan->samplers == 1 && imagePlan->bindings[2].imageAllocations.front() == 2 && imagePlan->bindings[1].imageAllocations.front() == 0, "image and sampler allocation ranges were conflated");
+    context.limits.maxPerStageDescriptorSampledImages = 3;
+    expectFailure([&] { BindingPlan plan(context, std::span(&imageShader, 1)); }, "per-stage limits");
+    {
+        DescriptorCache descriptors(context);
+        context.descriptorCache = &descriptors;
+        ShaderRecompiler::RecompileResult program;
+        program.variantId = 20;
+        program.pushConstants.resize(4);
+        program.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16)));
+        program.bindings.front().bufferWritten = {false};
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources before(context, shader);
+        const auto beforeWrite = findWrite(0);
+        program.bindings.front().guestDescriptor = vsharp(guestSecond.data(), 32);
+        mock.writes.clear();
+        ShaderResources after(context, shader);
+        const auto afterWrite = findWrite(0);
+        Require(&before.Plan() == &after.Plan(), "resource builds did not share invariant binding structure");
+        Require(beforeWrite.buffers.front().range == 16 && afterWrite.buffers.front().range == 32, "resource plan froze a runtime buffer range");
+        Require(sameBytes(bufferBytes(beforeWrite.buffers.front().buffer), guestFirst.data(), 16) && sameBytes(bufferBytes(afterWrite.buffers.front().buffer), guestSecond.data(), 32), "later materialization changed an earlier draw's data");
+    }
+    Require(mock.live == 0, "binding plan resources leaked Vulkan objects");
+}
+
 void resourceTests() {
     mock = MockVulkan{};
     const auto context = mockContext();
@@ -2391,6 +2467,7 @@ int main() {
         InitialContextTests();
         descriptorPoolTests();
         pushConstantTests();
+        bindingPlanTests();
         resourceTests();
         misalignedShaderDataTests();
         debugBranchTests();
