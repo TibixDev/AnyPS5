@@ -1983,7 +1983,14 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
-                if (const auto* range = containingRange(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, range->address, range->bytes, importRanges());
+                GuestAllocations::Lease targeted;
+                const bool haveLease = !lease.empty() || space != nullptr || !acquired.empty();
+                if (!haveLease) targeted = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(region.begin, bytes);
+                const bool stale = importsStale(context, state);
+                const auto& available = haveLease || stale ? importRanges() : targeted;
+                if (stale) refreshImports(context, state, available);
+                if (const auto* range = containingRange(available, region.begin, region.end))
+                    entry = importAllocation(context, state, range->address, range->bytes, available);
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
