@@ -103,12 +103,17 @@ int APS5_VABI sceNgs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* p
     for (std::uint32_t p = 0; p < num_params; p++) {
         const auto& param = params[p];
         if (!std::isfinite(param.angle) || !std::isfinite(param.distance) || !std::isfinite(param.fbw_level) || !std::isfinite(param.lfe_level)) APS5_INVALID_ARG_EX;
-        if (param.distance != 1.0f) throw std::runtime_error("NGS2: pan distance other than 1 is not implemented");
+        if (param.distance < 0.0f || param.distance > 1.0f) throw std::runtime_error("NGS2: pan distances outside the unit circle are not implemented");
         float gains[MAX_PAN_SPEAKERS] = {};
         const float angle = WrapDegrees(param.angle, work->unit_angle);
         if (numSpeakers == 1) gains[0] = 1.0f;
         else if (numSpeakers == 2) PanStereo(degrees, angle, gains);
         else PanAround(degrees, numSpeakers, angle, gains);
+        if (param.distance != 1.0f) {
+            const float diffusePower = (1.0f - param.distance) / numSpeakers;
+            for (std::uint32_t i = 0; i < numSpeakers; ++i)
+                gains[i] = std::sqrt(diffusePower + param.distance * gains[i] * gains[i]);
+        }
         float* row = out_volume_matrix + static_cast<std::size_t>(p) * matrix_format;
         for (std::uint32_t i = 0; i < numSpeakers; i++) {
             const auto channel = hasLfe && i >= LFE_CHANNEL ? i + 1 : i;
