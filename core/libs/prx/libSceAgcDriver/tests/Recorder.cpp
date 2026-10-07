@@ -1510,8 +1510,9 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         const auto commands = snapshotRecorder.Commands();
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         const auto copy = snapshotContext.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-        VkBufferCopy region{0, 0, elementBytes};
+        VkBufferCopy region{first->snapshots[0].offset, 0, elementBytes};
         copy(commands, first->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
+        region.srcOffset = second->snapshots[0].offset;
         region.dstOffset = elementBytes;
         copy(commands, second->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
@@ -1609,9 +1610,9 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
         Require(push[0] == std::byte{0} && adjustment == offset % alignment, "the inner view's shader offset is not its distance from the binding");
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
         Require(bindings != nullptr && bindings->snapshots.size() == 2, "read-only draw inputs were not snapshotted");
-        const auto outerContents = bindings->snapshots[0].buffer->Bytes();
+        const auto outerContents = bindings->snapshots[0].Bytes();
         Require(outerContents.size() >= outerBytes && std::memcmp(outerContents.data(), guest + outer, outerBytes) == 0, "an aligned draw snapshot misses its view's bytes");
-        const auto contents = bindings->snapshots[1].buffer->Bytes();
+        const auto contents = bindings->snapshots[1].Bytes();
         Require(contents.size() >= adjustment + elementBytes, "a draw snapshot ends before the bytes the shader reads");
         Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's offset into a draw snapshot misses the view's bytes");
         snapshotRecorder.Sync();
@@ -1699,8 +1700,11 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
             Require(actual.buffers.size() == original.buffers.size() && actual.images.size() == original.images.size(), "snapshot update omitted unchanged descriptors");
             for (const auto& [key, before] : original.buffers) {
                 const auto after = actual.buffers.at(key);
-                const auto expected = key.first == (allocation == 0 ? 2u : 7u) ? draw->snapshots.front().buffer->Handle() : before.buffer;
-                Require(after.buffer == expected && after.offset == before.offset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
+                const bool replaced = key.first == (allocation == 0 ? 2u : 7u);
+                const auto& snapshot = draw->snapshots.front();
+                const auto expected = replaced ? snapshot.buffer->Handle() : before.buffer;
+                Require(after.buffer == expected && after.offset == (replaced ? snapshot.offset : before.offset) && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
+                if (replaced) Require(std::memcmp(snapshot.Bytes().data(), moved.words.data(), moved.size) == 0, "snapshot descriptor points outside its uploaded words");
             }
             for (const auto& [key, before] : original.images) {
                 const auto after = actual.images.at(key);
@@ -1710,6 +1714,92 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         snapshots.Sync();
     }
     recorder.Activate();
+}
+
+void drawUploadTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::array<std::size_t, 7> sizes{4, 260, 4096, 65532, 12, 65540, 8188};
+    constexpr std::size_t batches = 3;
+    std::size_t total = 0;
+    for (const auto bytes : sizes) total += bytes * batches;
+    Buffer readback(context, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::vector<std::byte> expected(total);
+    std::shared_ptr<Buffer> held;
+    std::size_t heldOffset = 0;
+    std::size_t destination = 0;
+    for (std::size_t batch = 0; batch < batches; ++batch) {
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            const auto [buffer, offset] = recorder.AllocateDrawUpload(sizes[i]);
+            Require(offset % context.limits.minStorageBufferOffsetAlignment == 0, "draw upload violates storage descriptor alignment");
+            const auto value = static_cast<std::byte>(batch * sizes.size() + i + 1);
+            const auto bytes = buffer->Bytes().subspan(offset, sizes[i]);
+            std::fill(bytes.begin(), bytes.end(), value);
+            std::fill_n(expected.begin() + destination, sizes[i], value);
+            if (held == nullptr) {
+                held = buffer;
+                heldOffset = offset;
+            }
+            CopyBuffer(context, recorder.Commands(), buffer->Handle(), offset, readback.Handle(), destination, sizes[i]);
+            destination += sizes[i];
+        }
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+    }
+    recorder.Sync();
+    Require(std::equal(expected.begin(), expected.end(), readback.Bytes().begin()), "draw uploads were overwritten before the GPU read them");
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto [buffer, offset] = recorder.AllocateDrawUpload(65536);
+        std::fill_n(buffer->Bytes().begin() + offset, 65536, std::byte{0xff});
+    }
+    recorder.Sync();
+    Require(held->Bytes()[heldOffset] == std::byte{1}, "a retained upload was recycled after its batch completed");
+    std::cout << "Draw upload alignment, page rollover, large allocations and batch lifetime passed\n";
+}
+
+void drawBindingsBenchmark(const Device& device) {
+    std::unique_lock gpu(GpuMutex());
+    auto context = device.GetContext();
+    DeviceFunctions functions;
+    FillDeviceFunctions(context, functions);
+    if (std::getenv("APS5_NO_PROC_TABLE") == nullptr) context.functions = &functions;
+    DescriptorCache cache(context);
+    context.descriptorCache = &cache;
+    Recorder recorder(context);
+    recorder.Activate();
+    ShaderRecompiler::RecompileResult program;
+    std::vector<ShaderResources::MovedBuffer> moved;
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = i;
+        data.count = 1;
+        data.guestDescriptor.resize(64, i);
+        moved.push_back({i, 0, data.guestDescriptor.size() * sizeof(std::uint32_t), data.guestDescriptor});
+        program.bindings.push_back(std::move(data));
+    }
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    std::array<double, 7> times{};
+    std::uint64_t checksum = 0;
+    const auto lookups = DeviceProcLookups();
+    for (std::size_t pass = 0; pass < times.size() + 1; ++pass) {
+        const auto started = std::chrono::steady_clock::now();
+        for (unsigned batch = 0; batch < 160; ++batch) {
+            for (unsigned draw = 0; draw < 32; ++draw) {
+                moved.front().words.front() = batch * 32 + draw;
+                const auto bindings = resources.PrepareDrawBindings(recorder, moved);
+                Require(bindings != nullptr && bindings->snapshots.size() == moved.size(), "draw binding benchmark omitted an upload");
+                checksum += std::to_integer<std::uint8_t>(bindings->snapshots.front().Bytes().front());
+            }
+            recorder.Sync();
+            gpu.unlock();
+            gpu.lock();
+        }
+        if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / (160 * 32);
+    }
+    std::sort(times.begin(), times.end());
+    std::cout << "Draw binding benchmark: " << times[3] << " us/draw median, " << times.front() << " minimum, " << times.back() << " maximum, " << DeviceProcLookups() - lookups << " device lookups, checksum " << checksum << '\n';
 }
 
 void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
@@ -1768,10 +1858,10 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         const auto snapshot = [&](std::byte expected) {
             const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
-            const auto buffer = bindings->snapshots[0].buffer;
-            const auto contents = buffer->Bytes();
+            const auto& snapshot = bindings->snapshots[0];
+            const auto contents = snapshot.Bytes();
             Require(contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
-            return buffer;
+            return std::pair{snapshot.buffer, snapshot.offset};
         };
         const auto first = snapshot(std::byte{0x11});
         Require(snapshot(std::byte{0x11}) == first, "an unchanged draw input was copied again");
@@ -4015,6 +4105,10 @@ void keysFillTests(const Device& device, Recorder& recorder) {
 int main(int argc, char** argv) {
     try {
         Device device;
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-draw-bindings") {
+            drawBindingsBenchmark(device);
+            return 0;
+        }
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
@@ -4034,6 +4128,19 @@ int main(int argc, char** argv) {
         }
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-upload-only") {
+            drawUploadTests(device, recorder);
+            drawDescriptorWriteTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-only") {
+            resourceReadTests(device, recorder);
+            misalignedSnapshotTests(device, recorder);
+            drawSnapshotReuseTests(device, recorder);
+            drawSnapshotEvictionTests(device);
+            drawInputReuseTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {
             drawDescriptorWriteTests(device, recorder);
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
