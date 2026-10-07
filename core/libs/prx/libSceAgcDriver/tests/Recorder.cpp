@@ -2032,9 +2032,14 @@ void copiedBufferResidencyTests(const Device& device, Recorder& outer) {
     {
         GuestAllocations::Mutation mutation;
     }
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + bytes, bytes);
+    build();
+    const auto unrelated = updates.calls.back().buffers.at({0, 0});
+    Require(unrelated.buffer == stored.buffer && unrelated.offset == stored.offset, "unrelated mapping changes discarded copied residency");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, bytes);
     build();
     const auto remapped = updates.calls.back().buffers.at({0, 0});
-    Require(remapped.buffer != stored.buffer || remapped.offset != stored.offset, "copied residency survived a mapping generation change");
+    Require(remapped.buffer != stored.buffer || remapped.offset != stored.offset, "copied residency survived an overlapping mapping change");
     auto writerProgram = program;
     writerProgram.variantId = 1000011;
     auto writerUsage = writerProgram.bindings.front().Usage();
@@ -2046,6 +2051,15 @@ void copiedBufferResidencyTests(const Device& device, Recorder& outer) {
     const auto tinyFirst = recorder.ReadBuffer(address, 256);
     const auto tinySecond = recorder.ReadBuffer(address, 256);
     Require(tinyFirst.buffer == tinySecond.buffer && tinyFirst.offset != tinySecond.offset, "tiny copied buffers did not stream through distinct page slices");
+    BumpCollectEpoch();
+    const auto vertex = CopyDrawInput(context, &recorder, address, bytes, 1, Recorder::SnapshotUse::Vertex);
+    KeepDrawInput(&recorder, address, vertex, Recorder::SnapshotUse::Vertex, 0);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + bytes, bytes);
+    const auto prefix = CopyDrawInput(context, &recorder, address, bytes / 4, 1, Recorder::SnapshotUse::Vertex);
+    Require(prefix.reused && prefix.buffer == vertex.buffer, "unrelated mapping change discarded a larger vertex snapshot");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + bytes / 2, bytes / 4);
+    const auto replacedPrefix = CopyDrawInput(context, &recorder, address, bytes / 4, 1, Recorder::SnapshotUse::Vertex);
+    Require(!replacedPrefix.reused, "vertex prefix promoted a stale mapping proof for its cached tail");
     std::cout << "Copied buffers preserve unchanged residency, CPU writes, driver writes, overlapping views, mapping generations and GPU lifetime\n";
 }
 
@@ -2239,6 +2253,52 @@ void resourceBuildBenchmark(const Device& device, bool shaderData = false, bool 
     }
 }
 
+void bufferMappingBenchmark(const Device& device) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    context.bufferPool = std::make_shared<BufferPool>(context);
+    constexpr std::size_t count = 128;
+    constexpr std::size_t stride = 65536;
+    constexpr std::array<std::size_t, 4> sizes{128, 4096, 16384, 65536};
+    void* memory = AllocateWatched(count * stride, stride);
+    Require(memory != nullptr, "mapping benchmark requires watched memory");
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() { ReleaseWatched(memory, count * stride); }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    for (std::size_t i = 0; i < count; ++i) std::memset(static_cast<std::byte*>(memory) + i * stride, static_cast<int>(i), stride);
+    for (const bool mappingChanges : {false, true}) {
+        Recorder recorder(context);
+        recorder.Activate();
+        std::array<double, 9> times;
+        std::uint64_t checksum = 0;
+        std::uint64_t misses = 0;
+        for (std::size_t pass = 0; pass <= times.size(); ++pass) {
+            const auto started = std::chrono::steady_clock::now();
+            for (unsigned frame = 0; frame < 128; ++frame) {
+                if (mappingChanges) GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + count * stride, stride);
+                for (std::size_t i = 0; i < count; ++i) {
+                    AgcDriver::GuestMemory::BumpCollectEpoch();
+                    const auto input = address + i * stride;
+                    const auto bytes = sizes[i % sizes.size()];
+                    const auto copy = CopyDrawInput(context, &recorder, input, bytes, 1, Recorder::SnapshotUse::Vertex);
+                    KeepDrawInput(&recorder, input, copy, Recorder::SnapshotUse::Vertex, 0);
+                    checksum += std::to_integer<unsigned>(copy.buffer->Bytes()[0]) + std::to_integer<unsigned>(copy.buffer->Bytes()[bytes - 1]);
+                    if (pass != 0) misses += !copy.reused;
+                }
+            }
+            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / (128 * count);
+        }
+        std::ranges::sort(times);
+        Require(checksum == 10ull * 128 * count * (count - 1), "mapping benchmark copied the wrong input bytes");
+        std::cout << "Vertex copies (unrelated mappings " << mappingChanges << "): median " << times[4] << " us/request, p95 pass " << times.back() << " us, misses " << misses << "/" << times.size() * 128 * count << ", checksum " << checksum << '\n';
+    }
+}
+
 void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 65536;
@@ -2315,9 +2375,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         AgcDriver::GuestMemory::MarkWritten(element, 4);
         const auto afterStore = snapshot(std::byte{0x33});
         Require(afterStore != afterCpu, "a draw snapshot outlived a driver store to its range");
-        {
-            GuestAllocations::Mutation mutation;
-        }
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(element, elementBytes);
         Require(snapshot(std::byte{0x33}) != afterStore, "a draw snapshot outlived a registry mutation");
         snapshotRecorder.Sync();
     }
@@ -2414,7 +2472,9 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
         GuestAllocations::Mutation mutation;
         mutation.Remove(other);
     }
-    Require(!CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "a draw input outlived a registry mutation");
+    Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "a draw input was discarded by an empty registry mutation");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, size);
+    Require(!CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "a draw input outlived an overlapping registry mutation");
     const auto pool = address + 8192;
     const auto whole = CopyDrawInput(context, &recorder, pool, 12288, 1, Use::Vertex);
     Require(!whole.reused && std::memcmp(whole.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "the vertex pool copy is wrong");
@@ -4553,6 +4613,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-resource-build") {
             resourceBuildBenchmark(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-buffer-mappings") {
+            bufferMappingBenchmark(device);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-shader-data") {

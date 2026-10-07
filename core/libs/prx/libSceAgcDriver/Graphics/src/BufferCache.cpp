@@ -22,11 +22,15 @@ BufferCache::Slice BufferCache::Find(std::uint64_t address, std::size_t bytes, U
     ++stats.lookups;
     const auto found = use == Use::Vertex ? entries.lower_bound({address, use, bytes}) : entries.find({address, use, bytes});
     if (found == entries.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
-    if (found->second.mappingGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+    const auto mappingGeneration = GuestAllocations::GuestAllocationsValidateMapping_nid_postfix(address, std::get<2>(found->first), found->second.mappingGeneration);
+    const bool mappingChanged = mappingGeneration == 0;
+    if (mappingChanged || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         ++stats.invalidations;
+        stats.mappingInvalidations += mappingChanged;
         erase(found);
         return {};
     }
+    found->second.mappingGeneration = mappingGeneration;
     auto& recency = pools[poolIndex(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
     ++stats.hits;
