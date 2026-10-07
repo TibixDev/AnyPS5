@@ -5,38 +5,37 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::readUserWords(const QueueState& queue, DrawProgram& program) {
-    Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, program.resourceRegister);
-    const auto resources = program.nullPixel && !queue.shader.contains(program.resourceRegister) ? 0u : readRegister(queue.shader, program.resourceRegister);
+void DrawProgram::Read(const QueueState& queue, const DrawProgramPlan& source) {
+    plan = &source;
+    wordCount = 0;
+    if (source.nullPixel) return;
+    Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, source.resourceRegister);
+    const auto resources = readRegister(queue.shader, source.resourceRegister);
     const auto userCount = ((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u);
     require(userCount <= 32, "graphics user SGPR count exceeds the register bank");
-    program.userData.clear();
+    const auto prefix = source.merged ? 8u : 0u;
+    std::fill_n(words.begin(), prefix, 0u);
     for (std::uint32_t i = 0; i < userCount; ++i) {
-        Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, program.userDataBase + i);
-        program.userData.push_back(readUserData(queue.shader, program.userDataBase + i));
+        Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, source.userDataBase + i);
+        words[prefix + i] = readUserData(queue.shader, source.userDataBase + i);
     }
-}
-
-void Driver::initializeMerged(const QueueState& queue, DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired) {
-    program.merged = true;
-    program.mergedPointer = pointerBase;
-    program.mergedPointerRequired = pointerRequired;
-    program.firstUserSgpr = 0;
-    program.userData.insert(program.userData.begin(), 8, 0);
+    wordCount = prefix + userCount;
+    if (!source.merged) return;
+    const auto pointerBase = source.mergedPointer;
     Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
     Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
-    if (!pointerRequired && !queue.shader.contains(pointerBase) && !queue.shader.contains(pointerBase + 1)) return;
+    if (!source.mergedPointerRequired && !queue.shader.contains(pointerBase) && !queue.shader.contains(pointerBase + 1)) return;
     const auto low = readRegister(queue.shader, pointerBase);
     const auto high = readRegister(queue.shader, pointerBase + 1);
     const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
-    require(address != 0 || !pointerRequired, "merged shader user-data address is null");
+    require(address != 0 || !source.mergedPointerRequired, "merged shader user-data address is null");
     if (address == 0) return;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
-    program.userData[0] = low;
-    program.userData[1] = high;
+    words[0] = low;
+    words[1] = high;
 }
 
-std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
+std::shared_ptr<DrawPlan> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
     const auto programAddress = [&](std::uint32_t base) {
@@ -56,22 +55,20 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
         require(address - snapshot.codeAddress < snapshot.code.size() * sizeof(std::uint32_t), "graphics program is outside registered shader code");
         require(snapshot.type == type, "graphics program refers to an incompatible shader binary type");
         const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
-        DrawProgram result{
+        DrawProgramPlan result{
             {stage, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
             userDataBase,
             8,
-            {},
             {{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}},
             it->second,
             codeOffset
         };
         result.resourceRegister = rsrc2;
         result.nullPixel = nullPixel;
-        readUserWords(queue, result);
         return result;
     };
     {
-        auto product = std::make_shared<DrawDecode>();
+        auto product = std::make_shared<DrawPlan>();
         product->state = Graphics::DecodeState(queue);
         auto& programs = product->programs;
         auto& roles = product->roles;
@@ -85,7 +82,10 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
         if (graphics.stages.path == Graphics::ShaderPath::Tessellation) {
             append(0x148, 5, Stage::Local, 0x10b, 0x10c, Role::Local);
             append(0x108, 7, Stage::TessellationControl, 0x10b, 0x10c, Role::Hull);
-            initializeMerged(queue, programs.back(), 0x102, true);
+            programs.back().firstUserSgpr = 0;
+            programs.back().merged = true;
+            programs.back().mergedPointer = 0x102;
+            programs.back().mergedPointerRequired = true;
             append(0x0c8, 2, Stage::TessellationEvaluation, 0x08b, 0x08c, Role::Domain);
         } else if (graphics.stages.path == Graphics::ShaderPath::Geometry) {
             const auto frontAddress = programAddress(0xc8);
@@ -95,7 +95,10 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
             const auto type = snapshot->second->type;
             require(type == 2 || type == 4, "invalid geometry front binary type");
             append(0xc8, type, Stage::Mesh, 0x8b, 0x8c, Role::Main);
-            initializeMerged(queue, programs.back(), 0x82, type == 4);
+            programs.back().firstUserSgpr = 0;
+            programs.back().merged = true;
+            programs.back().mergedPointer = 0x82;
+            programs.back().mergedPointerRequired = type == 4;
             if (type == 4) append(0x88, 6, Stage::Mesh, 0x8b, 0x8c, Role::GeometryBack);
         } else {
             append(0xc8, 2, Stage::Vertex, 0x8b, 0x8c, Role::Main);
@@ -112,7 +115,7 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     }
 }
 
-void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
+void Driver::resolveDrawPlan(const QueueState& queue, const Submission& submission, std::shared_ptr<const DrawPlan>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
         struct LogScope {
@@ -121,6 +124,10 @@ void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submis
         } logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
         auto fresh = decodeDraw(queue, submission);
         if (verifyDrawRecipe() && registerKey) {
+            for (const auto& source : fresh->programs) {
+                DrawProgram inputs;
+                inputs.Read(queue, source);
+            }
             std::uint64_t facadeMismatches = 0;
             for (const auto read : readLog) {
                 if (Graphics::DrawKeyCovers(read)) continue;
@@ -129,7 +136,7 @@ void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submis
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: the decoders read %s register 0x%x, which DrawKeyRegisters lacks\n", Graphics::RegisterBankName(read.bank), read.offset);
             }
             std::uint64_t decodeMismatches = 0;
-            if (decode != nullptr && !sameDecode(*decode, *fresh)) {
+            if (decode != nullptr && !samePlan(*decode, *fresh)) {
                 decodeMismatches = 1;
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: the entry's decode differs from a fresh decode (key 0x%llx, target 0x%llx)\n", static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(fresh->state.color.address));
