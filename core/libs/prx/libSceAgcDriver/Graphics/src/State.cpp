@@ -777,7 +777,8 @@ std::optional<DepthClearPass> DecodeDepthClearPass(const QueueState& queue) {
     Require((view & 0x1fffu) == lastSlice, "depth clear over multiple slices is unsupported");
     const auto depthControl = read(cx, 0x200);
     Require((depthControl & 8u) == 0, "depth clear with depth bounds is unsupported");
-    Require((control->second & 1u) != 0 || (depthControl & 6u) == 0, "stencil clear with ordinary depth work is unsupported");
+    const bool depthUnchanged = (depthControl & 2u) == 0 || ((depthControl & 4u) == 0 && ((depthControl >> 4u) & 7u) == 7u);
+    Require((control->second & 1u) != 0 || depthUnchanged, "stencil clear with ordinary depth work is unsupported");
     Require((control->second & 2u) != 0 || (depthControl & 1u) == 0, "depth clear with ordinary stencil work is unsupported");
     VkImageAspectFlags aspects = 0;
     if ((control->second & 1u) != 0) {
@@ -856,7 +857,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     std::uint32_t targetMask = 0, shaderMask = 0;
     if (value(cx, 0x8e, targetMask) && value(cx, 0x8f, shaderMask) && value(cx, 0x202, word) && !colorControlSupported(word, ColorWriteMask(cx) != 0)) return colorControlMessage(word);
     if (auto reason = nonzero(cx, 0x1c4, ~0u, "depth or sample-mask export"); !reason.empty()) return reason;
-    if (PixelProgramUnset(queue)) return NullPixelProgramRejection(queue);
+    if (PixelProgramDisabled(queue)) return NullPixelProgramRejection(queue);
     for (const auto offset : {0x1b3u, 0x1b4u, 0x1c5u}) {
         if (find(cx, offset) != cx.end()) continue;
         char text[64];
@@ -870,6 +871,16 @@ bool PixelProgramUnset(const QueueState& queue) {
     const auto low = find(queue.shader, 0x008, RegisterBank::Shader);
     const auto high = find(queue.shader, 0x009, RegisterBank::Shader);
     return low != queue.shader.end() && high != queue.shader.end() && low->second == 0 && high->second == 0;
+}
+
+bool PixelProgramDisabled(const QueueState& queue) {
+    if (PixelProgramUnset(queue)) return true;
+    for (const auto offset : {0x1c5u, 0x203u, 0x1c4u}) {
+        const auto value = find(queue.context, offset);
+        if (value == queue.context.end() || value->second != 0) return false;
+    }
+    if (find(queue.context, 0x8e) == queue.context.end() || find(queue.context, 0x8f) == queue.context.end()) return false;
+    return ColorWriteMask(queue.context) == 0;
 }
 
 std::string NullPixelProgramRejection(const QueueState& queue) {

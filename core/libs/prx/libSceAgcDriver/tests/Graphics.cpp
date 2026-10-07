@@ -269,6 +269,25 @@ void stateTests() {
     const auto unset = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state), true);
     Require(unset.inputAddr == ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PerspectiveCenter), "unset pixel inputs of the null program did not read as PERSP_CENTER_ENA");
     for (const auto mode : unset.targetOutputMode) Require(mode == 0, "an unset SPI_SHADER_COL_FORMAT exported a color");
+    queue.shader[0x008] = 0xdead;
+    queue.context[0x1c4] = queue.context[0x1c5] = queue.context[0x203] = 0;
+    Require(AgcDriver::Graphics::PixelProgramDisabled(queue), "disabled pixel exports retained a stale shader");
+    Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "a disabled pixel shader required input registers");
+    for (const auto offset : {0x1c4u, 0x1c5u, 0x203u}) {
+        for (const auto value : {1u, 0x40u, 0x200u, 0x400u, 0x20000u}) {
+            queue.context[offset] = value;
+            Require(!AgcDriver::Graphics::PixelProgramDisabled(queue), "pixel exports or execution controls were ignored");
+        }
+        queue.context.erase(offset);
+        Require(!AgcDriver::Graphics::PixelProgramDisabled(queue), "missing state disabled a bound pixel shader");
+        queue.context[offset] = 0;
+    }
+    queue.context[0x8e] = 0xf;
+    Require(!AgcDriver::Graphics::PixelProgramDisabled(queue), "color writes disabled a bound pixel shader");
+    queue.context[0x8e] = 0;
+    queue.context[0x1b3] = queue.context[0x1b4] = queue.context[0x1b6] = 0xffffffffu;
+    const auto disabled = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state), true);
+    Require(disabled.interpolatorCount == 0 && disabled.inputAddr == ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PerspectiveCenter), "the null pixel program inherited stale input state");
 }
 
 void hardwareScreenOffsetTests() {
@@ -863,6 +882,14 @@ void depthClearPassTests() {
     queue.context[0x000] = 2;
     queue.context[0x200] = 0x701;
     Require(DecodeDepthClearPass(queue)->aspects == VK_IMAGE_ASPECT_STENCIL_BIT, "stencil-only clear included depth");
+    queue.context[0x200] = 0x773;
+    Require(DecodeDepthClearPass(queue)->aspects == VK_IMAGE_ASPECT_STENCIL_BIT, "an always-pass read-only depth test rejected a stencil clear");
+    queue.context[0x200] = 0x777;
+    expectFailure([&] { DecodeDepthClearPass(queue); }, "ordinary depth work");
+    queue.context[0x200] = 0x733;
+    expectFailure([&] { DecodeDepthClearPass(queue); }, "ordinary depth work");
+    queue.context[0x200] = 0x77b;
+    expectFailure([&] { DecodeDepthClearPass(queue); }, "depth bounds");
 }
 
 void cmaskPassTests() {
