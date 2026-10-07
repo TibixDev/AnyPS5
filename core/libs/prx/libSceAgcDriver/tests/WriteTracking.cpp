@@ -15,6 +15,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -181,6 +182,60 @@ void CheckVersionRanges() {
     Require(!UnchangedSince(base, bytes, 0), "an unknown generation was accepted");
     Require(UnchangedSince(base, bytes, checkpoints.back()), "the latest checkpoint was rejected");
 }
+
+void CheckCollectBoundaries() {
+    constexpr std::size_t bytes = 3 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() {
+#ifdef _WIN32
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+            Unwatch(reinterpret_cast<std::uint64_t>(memory), bytes);
+            munmap(memory, bytes);
+#endif
+        }
+    } cleanup{memory};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 17, bytes);
+    bool unboundedObserved = false;
+    std::thread observer([&] {
+        const auto before = CollectWrites(base + 7, 1);
+        memory[7] = 19;
+        const auto after = CollectWrites(base + 7, 1);
+        unboundedObserved = before != 0 && after > before && !UnchangedSince(base + 7, 1, before);
+    });
+    observer.join();
+    Require(unboundedObserved, "a thread without collect epochs reused a stale observation");
+    for (const auto offset : {7u, 4096u + 3u, static_cast<unsigned>(Block - 8), static_cast<unsigned>(Block + 3)}) {
+        BumpCollectEpoch();
+        const auto before = CollectWrites(base + offset, 16);
+        Require(before != 0, "an epoch lost watched coverage");
+        memory[offset] ^= 1;
+        BumpCollectEpoch();
+        Require(CollectWrites(base + offset, 16) > before && !UnchangedSince(base + offset, 16, before), "a new epoch missed a CPU write");
+        const auto observed = TrackerGeneration();
+        memory[offset + 1] ^= 1;
+        Require(CollectWritesUncached(base + offset, 16) > observed && !UnchangedSince(base + offset, 16, observed), "an uncached observation reused an epoch result");
+        const auto stored = MarkWritten(base + offset + 2, 1);
+        Require(CollectWrites(base + offset, 16) >= stored && !UnchangedSince(base + offset, 16, observed), "a memoized observation hid a driver write");
+    }
+#ifndef _WIN32
+    BumpCollectEpoch();
+    Require(CollectWrites(base, 1) != 0, "initial partial-block observation failed");
+    Unwatch(base + 4096, 4096);
+    Require(CollectWrites(base + 4096, 1) == 0, "an unwatched neighbor retained an epoch observation");
+    BumpCollectEpoch();
+    const auto before = CollectWrites(base, 16);
+    Require(before != 0, "an unwatched neighbor prevented collecting a watched prefix");
+    memory[0] ^= 1;
+    BumpCollectEpoch();
+    Require(CollectWrites(base, 16) > before && !UnchangedSince(base, 16, before), "partial-block fallback missed a CPU write");
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory + 4096, 4096);
+    Require(CollectWrites(base + 4096, 1) != 0, "a re-registered neighbor stayed unwatched");
+#endif
+}
 }
 
 int main() {
@@ -192,6 +247,7 @@ int main() {
         CheckSharedBlock();
         CheckOwnStore();
         CheckVersionRanges();
+        CheckCollectBoundaries();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

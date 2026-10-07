@@ -1107,8 +1107,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
-    const auto first = address & ~(page - 1);
-    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    auto first = address & ~(page - 1);
+    auto stop = (address + bytes + page - 1) & ~(page - 1);
     // One epoch for the lookup and the entry made after the walk: an unbumped thread's fresh epoch
     // must not differ between them.
     const auto epoch = currentCollectEpoch();
@@ -1140,7 +1140,20 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    auto scanFirst = first;
+    auto scanStop = stop;
+    if (useMemo && threadCollectEpoch != 0 && bytes <= WriteBlockBytes) {
+        const auto begin = first & ~(WriteBlockBytes - 1);
+        const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
+        if (end > begin && tracker.covers(begin, end - begin)) {
+            scanFirst = begin;
+            scanStop = end;
+        }
+    }
+    if (walkWrites(tracker, scanFirst, scanStop, StampKind::Cpu)) {
+        first = scanFirst;
+        stop = scanStop;
+    } else if ((scanFirst == first && scanStop == stop) || !walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
