@@ -66,7 +66,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
-    std::shared_ptr<const DrawDecode> decode;
+    std::shared_ptr<const DrawPlan> decode;
     std::shared_ptr<DrawEntry> dataEntry;
     std::uint64_t shapeKey = 0;
     if (registerKey) {
@@ -78,8 +78,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
         const auto found = drawCache.find(drawKey);
         if (found != drawCache.end()) {
-            entry = found->second;
-            decode = entry->decode;
+            entry = found->second.entry;
+            decode = entry->plan;
         } else {
             ++drawEntryCounters.absent;
             if (traceDrawCache()) {
@@ -90,10 +90,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 else ++counters.absentNewRegisters;
             }
             if (drawDataHits() && !drawParameters.indirect) {
-                if (const auto shape = drawShapes.find(shapeKey); shape != drawShapes.end()) {
-                    const auto kept = drawCache.find(shape->second);
-                    if (kept != drawCache.end() && kept->second->decode != nullptr && kept->second->shape == shapeKey) dataEntry = kept->second;
-                }
+                dataEntry = drawPlans.Find(shapeKey);
                 if (dataEntry != nullptr) ++drawEntryCounters.dataHits;
             }
         }
@@ -105,33 +102,23 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
-    if (dataEntry != nullptr) {
-        auto refreshed = std::make_shared<DrawDecode>(*dataEntry->decode);
-        for (auto& program : refreshed->programs) {
-            readUserWords(queue, program);
-            if (program.merged) initializeMerged(queue, program, program.mergedPointer, program.mergedPointerRequired);
-        }
-        if (verifyDrawDataHits()) {
-            const auto full = decodeDraw(queue, submission);
-            if (!sameDecode(*refreshed, *full)) {
-                std::size_t differing = 0;
-                while (differing < full->programs.size() && differing < refreshed->programs.size() && full->programs[differing].userData == refreshed->programs[differing].userData) ++differing;
-                char message[320];
-                std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: a data-only hit's decode differs from the full decode (key 0x%llx, shape 0x%llx, %zu / %zu programs, first with differing user words %zu, path %u / %u, target 0x%llx / 0x%llx)", static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey), refreshed->programs.size(), full->programs.size(), differing, static_cast<unsigned>(refreshed->state.stages.path), static_cast<unsigned>(full->state.stages.path), static_cast<unsigned long long>(refreshed->state.color.address), static_cast<unsigned long long>(full->state.color.address));
-                throw std::runtime_error(message);
-            }
-        }
-        decode = std::move(refreshed);
+    if (dataEntry != nullptr) decode = dataEntry->plan;
+    if (dataEntry != nullptr && verifyDrawDataHits()) {
+        const auto full = decodeDraw(queue, submission);
+        require(samePlan(*decode, *full), "APS5_VERIFY_DRAW_DATA_HITS: cached draw plan differs from full decode");
     }
-    resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
+    resolveDrawPlan(queue, submission, decode, registerKey, drawKey, profile);
     const auto& graphics = decode->state;
     const auto& pixel = decode->pixel;
-    std::vector<DrawProgram> programs = decode->programs;
+    std::array<DrawProgram, 5> inputStorage;
+    require(decode->programs.size() <= inputStorage.size(), "draw plan exceeds the graphics stage limit");
+    auto programs = std::span(inputStorage).first(decode->programs.size());
+    for (std::size_t i = 0; i < programs.size(); ++i) programs[i].Read(queue, decode->programs[i]);
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
-        auto& words = programs.front().userData;
-        require(programs.front().firstUserSgpr == 0 && words.size() >= ShaderRecompiler::MeshIndexBufferUserWord + 4, "mesh program lacks the hidden user words");
-        const auto descriptor = Graphics::MeshIndexBufferDescriptor(parameters, programs.front().binary.codeAddress);
+        auto words = programs.front().UserData();
+        require(programs.front().plan->firstUserSgpr == 0 && words.size() >= ShaderRecompiler::MeshIndexBufferUserWord + 4, "mesh program lacks the hidden user words");
+        const auto descriptor = Graphics::MeshIndexBufferDescriptor(parameters, programs.front().plan->binary.codeAddress);
         std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
     };
     if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
@@ -142,9 +129,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
         if (location == 0x280u) return std::nullopt;
         for (std::size_t i = 0; i < programs.size(); ++i) {
-            if (roles[i] == Role::Fragment || roles[i] == Role::GeometryBack || location < programs[i].userDataBase) continue;
-            const auto word = location - programs[i].userDataBase + (8u - programs[i].firstUserSgpr);
-            if (word < programs[i].userData.size()) return std::make_pair(i, static_cast<std::size_t>(word));
+            if (roles[i] == Role::Fragment || roles[i] == Role::GeometryBack || location < programs[i].plan->userDataBase) continue;
+            const auto word = location - programs[i].plan->userDataBase + (8u - programs[i].plan->firstUserSgpr);
+            if (word < programs[i].UserData().size()) return std::make_pair(i, static_cast<std::size_t>(word));
         }
         return std::nullopt;
     };
@@ -153,7 +140,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto sgprOf = [&](std::uint32_t location) -> std::int32_t {
             const auto word = locate(location);
             if (!word || word->first != 0) return -1;
-            return static_cast<std::int32_t>(programs.front().firstUserSgpr + word->second);
+            return static_cast<std::int32_t>(programs.front().plan->firstUserSgpr + word->second);
         };
         indirect.baseVertexSgpr = sgprOf(indirect.baseVertexLocation);
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
@@ -163,8 +150,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
-        memory.insert(memory.end(), program.memory.begin(), program.memory.end());
-        linked.push_back({roles[i], program.binary, program.userDataBase, program.firstUserSgpr, program.userData});
+        memory.insert(memory.end(), program.plan->memory.begin(), program.plan->memory.end());
+        linked.push_back({roles[i], program.plan->binary, program.plan->userDataBase, program.plan->firstUserSgpr, program.UserData()});
     }
     timing.Mark("prepare");
     phaseTiming.Phase(DrawRowProgramPrepare);
@@ -173,9 +160,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<std::vector<Graphics::DecodeRead>> decodeReads(programs.size());
     const auto decodeVertexInfo = [&](std::size_t i) {
         const auto& program = programs[i];
-        if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
+        if (program.plan->binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
-        vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
+        vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.plan->binary.header, program.plan->binary.headerAddress, program.UserData(), &decodeReads[i]);
     };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
@@ -219,7 +206,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             decodeVertexInfo(i);
             if (matched[i] != nullptr && verifyDrawRecipe() && (vertexInfos[i].has_value() != (matched[i]->vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *matched[i]->vertexInfo)))) {
                 static std::atomic<std::uint64_t> reports{0};
-                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit has a vertex stage info unlike its variant's\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress));
+                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit has a vertex stage info unlike its variant's\n", i, static_cast<unsigned long long>(programs[i].plan->binary.codeAddress));
                 std::lock_guard cacheLock(drawCacheMutex);
                 ++drawEntryCounters.verifyDecodeMismatches;
             }
@@ -257,7 +244,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         ++dataVerified;
         if (what == nullptr) return;
         char message[320];
-        std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a data-only hit differs from its full build in its %s (%zu runs / %zu words kept, %zu / %zu fresh; variant 0x%llx / 0x%llx; key 0x%llx, shape 0x%llx)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.runs.size(), kept.words.size(), runs.size(), words.size(), static_cast<unsigned long long>(kept.compiled->variantId), static_cast<unsigned long long>(compiled.variantId), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey));
+        std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a data-only hit differs from its full build in its %s (%zu runs / %zu words kept, %zu / %zu fresh; variant 0x%llx / 0x%llx; key 0x%llx, shape 0x%llx)", i, static_cast<unsigned long long>(programs[i].plan->binary.codeAddress), what, kept.runs.size(), kept.words.size(), runs.size(), words.size(), static_cast<unsigned long long>(kept.compiled->variantId), static_cast<unsigned long long>(compiled.variantId), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey));
         throw std::runtime_error(message);
     };
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
@@ -297,7 +284,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         require(result.pushConstants.size() <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stageIndices[i] = stages.size();
-        stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
+        stages.push_back({program.plan->binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
@@ -384,7 +371,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::set<std::size_t> patched;
             const auto patch = [&](const std::optional<std::pair<std::size_t, std::size_t>>& word, std::uint32_t value) {
                 if (!word) return;
-                programs[word->first].userData[word->second] = value;
+                programs[word->first].UserData()[word->second] = value;
                 patched.insert(word->first);
             };
             patch(baseVertexWord, indirect.recordBytes == 20 ? arguments.vertexOffset : arguments.firstVertexOrIndex);

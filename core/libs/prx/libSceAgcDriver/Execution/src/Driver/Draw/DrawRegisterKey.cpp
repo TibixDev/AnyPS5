@@ -83,7 +83,7 @@ bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, co
     return true;
 }
 
-bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
+bool Driver::samePlan(const DrawPlan& a, const DrawPlan& b) {
     const auto& s = a.state;
     const auto& t = b.state;
     const auto sameColor = [](const Graphics::ColorTarget& x, const Graphics::ColorTarget& y) {
@@ -119,7 +119,7 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     for (std::size_t i = 0; i < a.programs.size(); ++i) {
         const auto& x = a.programs[i];
         const auto& y = b.programs[i];
-        if (x.binary.stage != y.binary.stage || x.binary.codeAddress != y.binary.codeAddress || x.userDataBase != y.userDataBase || x.firstUserSgpr != y.firstUserSgpr || x.userData != y.userData || x.snapshot != y.snapshot || x.codeOffset != y.codeOffset) return false;
+        if (x.binary.stage != y.binary.stage || x.binary.codeAddress != y.binary.codeAddress || x.userDataBase != y.userDataBase || x.firstUserSgpr != y.firstUserSgpr || x.snapshot != y.snapshot || x.codeOffset != y.codeOffset || x.resourceRegister != y.resourceRegister || x.nullPixel != y.nullPixel || x.merged != y.merged || x.mergedPointer != y.mergedPointer || x.mergedPointerRequired != y.mergedPointerRequired) return false;
     }
     return true;
 }
