@@ -139,6 +139,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindingPlan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
@@ -484,6 +485,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/ColorTargetLayout.cpp
         Graphics/src/ColorTargetTransfer.cpp
         Graphics/src/Resources.cpp
+        Graphics/src/BufferCache.cpp
         Graphics/src/BindingPlan.cpp
         Graphics/src/ShaderResources.cpp
         Graphics/src/ShaderAddressResources.cpp
@@ -634,6 +636,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/Pipeline.cpp
             Graphics/src/PipelineCache.cpp
             Graphics/src/Resources.cpp
+            Graphics/src/BufferCache.cpp
             Graphics/src/BindingPlan.cpp
             Graphics/src/ShaderResources.cpp
             Graphics/src/ShaderAddressResources.cpp

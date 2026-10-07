@@ -2025,6 +2025,10 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             region.pending = true;
             continue;
         }
+        if (!addressable && !region.sparse && Recorder::Active() != nullptr) {
+            region.pending = true;
+            continue;
+        }
         copyRegion(region, addressable);
     }
 }
@@ -2217,6 +2221,16 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto bytes = region.end - region.begin;
+    if (!addressable && !region.sparse && bytes <= context.limits.maxStorageBufferRange && (region.hostBacked || region.writable) && !WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
+        if (auto* recorder = Recorder::Active()) {
+            const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::BufferUpload);
+            const auto slice = recorder->ReadBuffer(region.begin, static_cast<std::size_t>(bytes));
+            region.buffer = slice.buffer;
+            region.bufferOffset = slice.offset;
+            region.snapshot.clear();
+            return;
+        }
+    }
     const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
     if (profile) {
         // Why the region is copied rather than bound in place, totalled every 1000 uploads (under a
@@ -2456,7 +2470,7 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     Require(adjustment % 4 == 0, "guest buffer view off the storage buffer offset alignment is not DWORD aligned");
     Require(bytes + adjustment <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
     const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
-    return {handle, offset - adjustment, bytes + adjustment};
+    return {handle, offset - adjustment + (region.direct == nullptr && region.mirror == nullptr ? region.bufferOffset : 0), bytes + adjustment};
 }
 
 ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& region) {

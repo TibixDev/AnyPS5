@@ -1104,6 +1104,11 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
     AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    if (const auto* recorder = Recorder::Active()) {
+        const auto& buffers = recorder->BufferCounters();
+        AgcDriver::ProfilePrint_nid_no_patch("[buffer-cache] %llu lookups, %llu hits, %llu invalidations, %llu evictions; %llu read-only uploads, %.1f MiB streamed\n", static_cast<unsigned long long>(buffers.lookups), static_cast<unsigned long long>(buffers.hits), static_cast<unsigned long long>(buffers.invalidations), static_cast<unsigned long long>(buffers.evictions), static_cast<unsigned long long>(buffers.uploads), buffers.uploadedBytes / 1048576.0);
+    }
+
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {

@@ -1757,6 +1757,138 @@ void drawUploadTests(const Device& device, Recorder& recorder) {
     std::cout << "Draw upload alignment, page rollover, large allocations and batch lifetime passed\n";
 }
 
+void copiedBufferResidencyTests(const Device& device, Recorder& outer) {
+    using namespace AgcDriver::GuestMemory;
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    context.limits.minStorageBufferOffsetAlignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    DescriptorUpdates updates(context);
+    DescriptorCache descriptors(context);
+    context.descriptorCache = &descriptors;
+    Recorder recorder(context);
+    recorder.Activate();
+    constexpr std::size_t bytes = 65536;
+    void* block = AllocateWatched(bytes, bytes);
+    Require(block != nullptr, "copied-buffer test requires watched memory");
+    struct Release {
+        void* block;
+        Recorder& recorder;
+        Recorder& outer;
+        ~Release() { recorder.Sync(); ReleaseWatched(block, bytes); outer.Activate(); }
+    } release{block, recorder, outer};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::memset(block, 0x11, bytes);
+    const auto descriptor = [](std::uint64_t address, std::uint32_t size) {
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, size, 0x31016fac};
+    };
+    ShaderRecompiler::RecompileResult program;
+    program.variantId = 1000010;
+    program.pushConstants.resize(16);
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.binding = 0;
+    binding.count = 2;
+    binding.bufferWritten = {false, false};
+    for (auto word : descriptor(address, 8192)) binding.guestDescriptor.push_back(word);
+    for (auto word : descriptor(address + 4, 64)) binding.guestDescriptor.push_back(word);
+    program.bindings.push_back(binding);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const auto build = [&] {
+        auto resources = std::make_shared<ShaderResources>(context, shader);
+        Require(!resources->HasCopiedWrites() && !resources->HoldsLease(), "read-only residency became a copied writer or pinned guest memory");
+        recorder.Keep(resources);
+        return resources;
+    };
+    const auto first = build();
+    const auto firstInfo = updates.calls.back().buffers.at({0, 0});
+    const auto innerInfo = updates.calls.back().buffers.at({0, 1});
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    first->PatchPushConstants(push);
+    Require(innerInfo.buffer == firstInfo.buffer && innerInfo.offset == firstInfo.offset && innerInfo.range == 68 && push[1] == std::byte{4}, "copied residency lost a misaligned overlapping view");
+    const auto uploads = recorder.BufferCounters().uploads;
+    build();
+    const auto repeated = updates.calls.back().buffers.at({0, 0});
+    Require(repeated.buffer == firstInfo.buffer && repeated.offset == firstInfo.offset && recorder.BufferCounters().uploads == uploads, "unchanged copied buffers were uploaded again");
+    Buffer readback(context, 768, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto recordRead = [&](const VkDescriptorBufferInfo& info, std::size_t destination) {
+        const auto commands = recorder.Commands();
+        CopyBuffer(context, commands, info.buffer, info.offset, readback.Handle(), destination, 256);
+    };
+    recordRead(firstInfo, 0);
+    std::memset(block, 0x22, 256);
+    build();
+    const auto changed = updates.calls.back().buffers.at({0, 0});
+    Require(changed.buffer != firstInfo.buffer || changed.offset != firstInfo.offset, "CPU writes overwrote a retained buffer version");
+    recordRead(changed, 256);
+    std::memset(block, 0x33, 256);
+    MarkWritten(address, 256);
+    build();
+    const auto stored = updates.calls.back().buffers.at({0, 0});
+    recordRead(stored, 512);
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Sync();
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto contents = readback.Bytes().subspan(i * 256, 256);
+        Require(std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == static_cast<std::byte>(0x11 * (i + 1)); }), "GPU reads did not preserve each copied buffer version");
+    }
+    {
+        GuestAllocations::Mutation mutation;
+    }
+    build();
+    const auto remapped = updates.calls.back().buffers.at({0, 0});
+    Require(remapped.buffer != stored.buffer || remapped.offset != stored.offset, "copied residency survived a mapping generation change");
+    auto writerProgram = program;
+    writerProgram.variantId = 1000011;
+    writerProgram.bindings.front().bufferWritten[1] = true;
+    const CompiledShader writerShader{ShaderRecompiler::ShaderStage::Compute, &writerProgram, 0};
+    ShaderResources writer(context, writerShader);
+    Require(writer.HasCopiedWrites() && updates.calls.back().buffers.at({0, 0}).buffer != remapped.buffer, "an overlapping writer reused immutable read-only storage");
+    const auto tinyFirst = recorder.ReadBuffer(address, 256);
+    const auto tinySecond = recorder.ReadBuffer(address, 256);
+    Require(tinyFirst.buffer == tinySecond.buffer && tinyFirst.offset != tinySecond.offset, "tiny copied buffers did not stream through distinct page slices");
+    std::cout << "Copied buffers preserve unchanged residency, CPU writes, driver writes, overlapping views, mapping generations and GPU lifetime\n";
+}
+
+void copiedBackingTests(const Device& device, Recorder& recorder) {
+    constexpr std::size_t bytes = 65536;
+    struct Release {
+        Recorder& recorder;
+        std::array<void*, 2> mappings{};
+        std::array<std::int64_t, 2> physical{-1, -1};
+        ~Release() {
+            recorder.Sync();
+            for (const auto mapping : mappings) if (mapping != nullptr) sceKernelMunmap(mapping, bytes);
+            for (const auto backing : physical) if (backing >= 0) sceKernelReleaseDirectMemory(backing, bytes);
+        }
+    } release{recorder};
+    for (auto& backing : release.physical) Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, bytes, 0, &backing) == 0, "allocate copied buffer backing");
+    Require(sceKernelMapDirectMemory(&release.mappings[0], bytes, 3, 0, release.physical[0], bytes) == 0, "map copied buffer backing");
+    std::memset(release.mappings[0], 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(release.mappings[0]);
+    const auto first = recorder.ReadBuffer(address, 8192);
+    Require(sceKernelMapDirectMemory(&release.mappings[1], bytes, 3, 0, release.physical[0], bytes) == 0, "alias copied buffer backing");
+    std::memset(release.mappings[1], 0x22, bytes);
+    const auto throughAlias = recorder.ReadBuffer(address, 8192);
+    Require(sceKernelMapDirectMemory(&release.mappings[0], bytes, 3, 0x10, release.physical[1], bytes) == 0, "replace copied backing at the same address");
+    std::memset(release.mappings[0], 0x33, bytes);
+    const auto remapped = recorder.ReadBuffer(address, 8192);
+    const auto alias = recorder.ReadBuffer(reinterpret_cast<std::uint64_t>(release.mappings[1]), 8192);
+    const std::array<BufferCache::Slice, 4> versions{first, throughAlias, remapped, alias};
+    const std::array<std::byte, 4> expected{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x22}};
+    const auto& context = device.GetContext();
+    Buffer readback(context, 4 * 8192, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    for (std::size_t i = 0; i < versions.size(); ++i) CopyBuffer(context, recorder.Commands(), versions[i].buffer->Handle(), versions[i].offset, readback.Handle(), i * 8192, 8192);
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Sync();
+    for (std::size_t i = 0; i < versions.size(); ++i) {
+        const auto contents = readback.Bytes().subspan(i * 8192, 8192);
+        Require(std::all_of(contents.begin(), contents.end(), [&](auto value) { return value == expected[i]; }), "copied buffer reused stale alias or remapped contents");
+    }
+    std::cout << "Copied buffer aliases and same-address backing replacement preserve recorded GPU reads\n";
+}
+
 void drawBindingsBenchmark(const Device& device) {
     std::unique_lock gpu(GpuMutex());
     auto context = device.GetContext();
@@ -1820,7 +1952,7 @@ void resourceBuildBenchmark(const Device& device) {
     context.bufferPool = std::make_shared<BufferPool>(context);
     Recorder recorder(context);
     recorder.Activate();
-    constexpr std::size_t bytes = 16 * 16384;
+    constexpr std::size_t bytes = 16 * 65536;
     void* memory = AllocateWatched(bytes, 65536);
     Require(memory != nullptr, "resource benchmark requires watched memory");
     struct Cleanup {
@@ -1831,9 +1963,10 @@ void resourceBuildBenchmark(const Device& device) {
     } cleanup{context, recorder, memory};
     std::memset(memory, 0x71, bytes);
     const auto address = reinterpret_cast<std::uint64_t>(memory);
+    for (const std::uint32_t inputBytes : {256u, 16384u}) {
     for (const std::uint32_t imageCount : {0u, 8u}) {
         ShaderRecompiler::RecompileResult program;
-        program.variantId = 1000000 + imageCount;
+        program.variantId = 1000000 + imageCount + inputBytes;
         program.pushConstants.resize(16);
         for (std::uint32_t i = 0; i < 8; ++i) {
             ShaderRecompiler::DescriptorBinding binding{};
@@ -1842,8 +1975,8 @@ void resourceBuildBenchmark(const Device& device) {
             binding.binding = i;
             binding.count = 1;
             binding.bufferWritten = {false};
-            const auto base = address + i * 256;
-            binding.guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32), 256, 0x31016fac};
+            const auto base = address + i * inputBytes;
+            binding.guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32), inputBytes, 0x31016fac};
             program.bindings.push_back(std::move(binding));
         }
         for (std::uint32_t i = 0; i < imageCount; ++i) {
@@ -1853,7 +1986,7 @@ void resourceBuildBenchmark(const Device& device) {
             binding.binding = 8 + i;
             binding.count = 1;
             binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-            const auto base = address + (i + 1) * 16384;
+            const auto base = address + 8 * 65536 + i * 16384;
             binding.guestDescriptor = {static_cast<std::uint32_t>(base >> 8), static_cast<std::uint32_t>(base >> 40) | (56u << 20) | (3u << 30), 15u | (63u << 14), 0x90000fac, 0, 0, 0, 0};
             program.bindings.push_back(std::move(binding));
         }
@@ -1864,12 +1997,15 @@ void resourceBuildBenchmark(const Device& device) {
         for (std::size_t pass = 0; pass <= times.size(); ++pass) {
             const auto started = std::chrono::steady_clock::now();
             for (unsigned batch = 0; batch < 32; ++batch) {
+                AgcDriver::GuestMemory::BumpCollectEpoch();
+                static_cast<void>(recorder.Commands());
                 for (unsigned draw = 0; draw < 32; ++draw) {
-                    const auto base = address + ((batch * 32 + draw) % 8) * 256;
+                    const auto base = address + ((batch * 32 + draw) % 8) * inputBytes;
                     program.bindings.front().guestDescriptor[0] = static_cast<std::uint32_t>(base);
                     program.bindings.front().guestDescriptor[1] = static_cast<std::uint32_t>(base >> 32);
-                    ShaderResources resources(context, std::span(&shader, 1), target, 0, 0);
-                    checksum += resources.LayoutKey().size();
+                    auto resources = std::make_shared<ShaderResources>(context, std::span(&shader, 1), target, 0, 0);
+                    checksum += resources->LayoutKey().size();
+                    recorder.Keep(std::move(resources));
                 }
                 recorder.Sync();
                 gpu.unlock();
@@ -1878,7 +2014,8 @@ void resourceBuildBenchmark(const Device& device) {
             if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / 1024;
         }
         std::sort(times.begin(), times.end());
-        std::cout << "Resource build (" << imageCount << " textures): median " << times[4] << " us, p95 " << times[8] << " us, minimum " << times[0] << " us, checksum " << checksum << '\n';
+        std::cout << "Resource batches (" << inputBytes << " byte inputs, " << imageCount << " textures): median " << times[4] << " us/draw, p95 pass " << times[8] << " us/draw, minimum " << times[0] << " us, checksum " << checksum << '\n';
+    }
     }
 }
 
@@ -4217,6 +4354,11 @@ int main(int argc, char** argv) {
         }
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--copied-buffers-only") {
+            copiedBufferResidencyTests(device, recorder);
+            copiedBackingTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-upload-only") {
             drawUploadTests(device, recorder);
             drawDescriptorWriteTests(device, recorder);
