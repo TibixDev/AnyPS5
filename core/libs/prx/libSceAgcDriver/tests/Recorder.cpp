@@ -29,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -168,6 +169,7 @@ public:
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0, &context.queue);
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
             pool.queueFamilyIndex = family;
             Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.pool), "vkCreateCommandPool");
         } catch (...) {
@@ -2625,6 +2627,53 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
+void pendingMaskBenchmark(const Device& device) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    Recorder recorder(context);
+    recorder.Activate();
+    for (const auto extent : {VkExtent2D{64, 64}, VkExtent2D{512, 512}, VkExtent2D{1920, 1080}, VkExtent2D{3840, 2160}}) {
+        GuestTextureResource resource{};
+        resource.width = extent.width;
+        resource.height = extent.height;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto bytes = DescribeSurface(resource).guestBytes;
+        void* memory = AllocateWatched(bytes, 65536);
+        Require(memory != nullptr, "pending mask benchmark requires watched memory");
+        struct Cleanup {
+            Recorder& recorder;
+            void* memory;
+            std::size_t bytes;
+            ~Cleanup() { recorder.Sync(); ReleaseWatched(memory, bytes); }
+        } cleanup{recorder, memory, static_cast<std::size_t>(bytes)};
+        std::memset(memory, 0, bytes);
+        resource.baseAddress = reinterpret_cast<std::uint64_t>(memory);
+        auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+        recorder.Sync();
+        std::array<double, 9> times;
+        for (unsigned pass = 0; pass <= times.size(); ++pass) {
+            const auto started = std::chrono::steady_clock::now();
+            for (unsigned i = 0; i < 65536; ++i) image->MarkDirty();
+            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - started).count() / 65536;
+        }
+        std::ranges::sort(times);
+        std::cout << "Pending image " << extent.width << 'x' << extent.height << ", units " << (bytes + 65535) / 65536 << ": median " << times[4] << " ns/mark, p95 pass " << times.back() << " ns\n";
+        image->Flush();
+    }
+}
+
 void keysFillTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -2741,13 +2790,28 @@ void keysFillTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         Device device;
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-pending-masks") {
+            pendingMaskBenchmark(device);
+            return 0;
+        }
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--pending-storage-only") {
+            movedMetadataTests(device, recorder);
+            unitShadowTests(device, recorder);
+            storageRefreshTests(device, recorder, false);
+            storageRefreshTests(device, recorder, true);
+            writeBackPaddingTests(device, recorder, false);
+            writeBackPaddingTests(device, recorder, true);
+            std::cout << "Pending storage ownership and write-back tests passed\n";
+            return 0;
+        }
+
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
