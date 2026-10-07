@@ -170,10 +170,15 @@ void registeredPageAccessTests() {
         Require(declined && accessible, "a busy allocation registry prevented querying host page access");
     }
     Require(GuestMemory::Accessible(block, 3 * page, true), "initial mapped pages are inaccessible");
-    Require(GuestMemory::DescribeCommitted(base, 3 * page, true).whole, "initial mapping is incomplete");
+    const auto full = GuestMemory::DescribeCommitted(base, 3 * page, true);
+    Require(full.whole && full.partialRanges.empty(), "complete mapping retained partial ranges");
+    Require(GuestMemory::CommittedRanges(base, 3 * page, true) == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{base, base + 3 * page}}, "complete mapping lost its explicit range");
+    const auto empty = GuestMemory::DescribeCommitted(base, 0);
+    Require(empty.whole && empty.partialRanges.empty() && GuestMemory::CommittedRanges(base, 0).empty(), "empty mapping has committed bytes");
     Require(mprotect(block + 2 * page, page, PROT_READ) == 0, "cannot protect the unregistered neighbor");
     Require(!GuestMemory::Accessible(block + 2 * page, page, true), "a registered mapping hid its neighbor's protection change");
-    Require(!GuestMemory::DescribeCommitted(base, 3 * page, true).whole, "committed ranges ignored an unregistered neighbor's protection");
+    const auto prefix = GuestMemory::DescribeCommitted(base, 3 * page, true);
+    Require(!prefix.whole && prefix.partialRanges == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{base, base + 2 * page}}, "committed ranges ignored an unregistered neighbor's protection");
     {
         GuestAllocations::Mutation mutation;
         mutation.Protect(block + page, page, true, false, [&] {
@@ -222,7 +227,10 @@ void registeredPageAccessTests() {
         });
     }
     Require(!GuestMemory::Accessible(block + page, page), "an unmapped page retained cached read access");
-    Require(!GuestMemory::DescribeCommitted(base, 3 * page).whole, "an unmapped page retained cached commitment");
+    const auto split = GuestMemory::DescribeCommitted(base, 3 * page);
+    Require(!split.whole && split.partialRanges == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{base, base + page}, {base + 2 * page, base + 3 * page}}, "an unmapped page retained cached commitment");
+    const auto protectedRange = GuestMemory::DescribeCommitted(base, 3 * page, true);
+    Require(!protectedRange.whole && protectedRange.partialRanges.empty(), "protected pages acquired a writable subrange");
     {
         GuestAllocations::Mutation mutation;
         Require(mmap(block + page, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == block + page, "cannot reuse an unmapped address");
@@ -236,6 +244,8 @@ void registeredPageAccessTests() {
         });
     }
     Require(GuestMemory::Accessible(block + page, page, true), "address reuse retained an inaccessible mapping");
+    const auto restored = GuestMemory::DescribeCommitted(base, 3 * page);
+    Require(restored.whole && restored.partialRanges.empty(), "adjacent readable mappings were not coalesced");
     Require(GuestMemory::CommittedRanges(base, 3 * page, true) == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{base + page, base + 2 * page}}, "address reuse retained stale committed ranges");
     {
         GuestAllocations::Mutation mutation;

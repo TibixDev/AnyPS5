@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindingPlan.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -12,6 +13,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <optional>
 #include <mutex>
 #include <string>
@@ -66,6 +68,7 @@ public:
         std::uint64_t pools = 0;
     };
     Stats Counters() const;
+    std::shared_ptr<const BindingPlan> Plan(std::span<const CompiledShader> shaders) { return plans.Get(shaders); }
 
 private:
     Context context;
@@ -81,6 +84,7 @@ private:
     };
     std::vector<Pool> pools;
     Stats stats;
+    BindingPlanCache plans;
 };
 
 class ShaderResources {
@@ -150,7 +154,8 @@ public:
     // a draw for which neither holds (Draw.cpp).
     bool WritesMemory() const;
     bool ReadsImage(const StorageTexture* image) const;
-    const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
+    const std::vector<std::uint32_t>& LayoutKey() const { return bindingPlan->layoutKey; }
+    const BindingPlan& Plan() const { return *bindingPlan; }
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
     std::string Describe() const;
 
@@ -229,6 +234,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> PresyncSurfaces() const;
 
 private:
+    std::pmr::monotonic_buffer_resource allocationArena;
     struct DescribedRange {
         const char* kind;
         std::uint64_t address;
@@ -239,12 +245,12 @@ private:
         int tileMode = 0;
         std::uint64_t dccAddress = 0;
     };
-    std::vector<DescribedRange> describedRanges;
+    std::pmr::vector<DescribedRange> describedRanges{&allocationArena};
     struct Allocation {
         std::uint64_t address;
         std::size_t size;
         bool guest;
-        std::unique_ptr<Buffer> buffer;
+        std::shared_ptr<Buffer> buffer;
         ShaderRecompiler::DescriptorRole role = ShaderRecompiler::DescriptorRole::ShaderData;
         // Guest buffers: whether the shader may store to the range (see addGuestBuffer).
         bool written = true;
@@ -254,6 +260,9 @@ private:
         std::int32_t pushByte = -1;
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
+        std::size_t bufferOffset = 0;
+        std::span<const std::uint32_t> pendingData;
+        std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(bufferOffset, size); }
     };
     struct DataPatch {
         std::size_t allocation;
@@ -262,11 +271,7 @@ private:
     };
     void writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const;
 
-    struct Binding {
-        VkDescriptorSetLayoutBinding layout;
-        std::vector<std::size_t> allocations;
-        std::vector<std::size_t> imageAllocations;
-    };
+    using Binding = BindingPlan::Binding;
 
     // A host-imported buffer region the set reads in place, with its import's identity at build time.
     struct DirectRegion {
@@ -293,7 +298,7 @@ private:
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
-    void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags);
+    void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, std::size_t index);
     // Stage A: one record per planned image element (ImageRecord), in plan order: the decoded
     // descriptor and its surface size (computed once for the build), the write watch walked so stage
     // B's collects are memo hits (APS5_NO_PRECOLLECT=1 skips the pass entirely), and for a sampled
@@ -327,7 +332,7 @@ private:
     // Stage B: the record's texture when the fastRevalidate predicate proves it current under the
     // lock and the cache still holds it; null sends the element to cachedTexture.
     std::shared_ptr<Texture> fastTexture(const ImageRecord& record);
-    void resolveImageBinding(const ShaderRecompiler::DescriptorBinding& binding, Binding& item);
+    void resolveImageBinding(const ShaderRecompiler::DescriptorBinding& binding);
     void forgetDeferredInputs();
     void release() noexcept;
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
@@ -388,7 +393,7 @@ private:
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
     Context context;
-    std::vector<std::uint32_t> layoutKey;
+    std::shared_ptr<const BindingPlan> bindingPlan;
     GuestBufferMemory guestMemory;
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
@@ -401,26 +406,25 @@ private:
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // The cache pool the set was allocated from, freed back to it on release.
     DescriptorCache::SetAllocation cacheAllocation;
-    std::vector<Allocation> allocations;
-    std::vector<VkDescriptorPoolSize> descriptorSizes;
-    std::vector<VkDescriptorBufferInfo> descriptorBuffers;
-    std::vector<VkDescriptorImageInfo> descriptorImages;
-    std::vector<VkWriteDescriptorSet> descriptorWrites;
+    std::pmr::vector<Allocation> allocations{&allocationArena};
+    std::pmr::vector<VkDescriptorBufferInfo> descriptorBuffers{&allocationArena};
+    std::pmr::vector<VkDescriptorImageInfo> descriptorImages{&allocationArena};
+    std::pmr::vector<VkWriteDescriptorSet> descriptorWrites{&allocationArena};
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
-    std::vector<std::shared_ptr<Texture>> textures;
-    std::vector<bool> textureFirstLayer;
-    std::vector<std::shared_ptr<StorageTexture>> storageTextures;
-    std::vector<std::uint32_t> storageMips;
-    std::vector<std::uint64_t> storageKeys;
-    std::vector<bool> storageFirstLayer;
-    std::vector<bool> storageWritten;
-    std::vector<bool> storageAtomic;
-    std::vector<std::shared_ptr<Sampler>> samplers;
+    std::pmr::vector<std::shared_ptr<Texture>> textures{&allocationArena};
+    std::pmr::vector<bool> textureFirstLayer{std::pmr::polymorphic_allocator<bool>{&allocationArena}};
+    std::pmr::vector<std::shared_ptr<StorageTexture>> storageTextures{&allocationArena};
+    std::pmr::vector<std::uint32_t> storageMips{&allocationArena};
+    std::pmr::vector<std::uint64_t> storageKeys{&allocationArena};
+    std::pmr::vector<bool> storageFirstLayer{std::pmr::polymorphic_allocator<bool>{&allocationArena}};
+    std::pmr::vector<bool> storageWritten{std::pmr::polymorphic_allocator<bool>{&allocationArena}};
+    std::pmr::vector<bool> storageAtomic{std::pmr::polymorphic_allocator<bool>{&allocationArena}};
+    std::pmr::vector<std::shared_ptr<Sampler>> samplers{&allocationArena};
     bool reusable = false;
-    std::vector<DirectRegion> directRegions;
-    std::vector<ValidatedSurface> validatedTextures;
+    std::pmr::vector<DirectRegion> directRegions{&allocationArena};
+    std::pmr::vector<ValidatedSurface> validatedTextures{&allocationArena};
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,
     // no image other than the object's own sources has results pending over its surfaces and
@@ -431,21 +435,14 @@ private:
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
     void rehashDataWords();
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
-    std::vector<DataPatch> dataPatches;
+    std::pmr::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches{&allocationArena};
+    std::pmr::vector<DataPatch> dataPatches{&allocationArena};
     BuildTiming timing;
     // Build state carried from stage A to stage B: the bindings in plan order, the image bindings
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),
     // the descriptor counts the set was sized for, and the compute stage of a deferred build.
-    std::vector<Binding> bindings;
-    struct DeferredImages {
-        const ShaderRecompiler::DescriptorBinding* binding;
-        std::size_t index;
-    };
-    std::vector<DeferredImages> deferredImages;
-    std::uint64_t storageBuffers = 0;
-    std::uint32_t plannedSampledImages = 0;
-    std::uint32_t plannedStorageImages = 0;
+    std::span<const Binding> bindings;
+    std::pmr::vector<const ShaderRecompiler::DescriptorBinding*> deferredImages{&allocationArena};
     // The compute constructor's shader and captured regions: the caller's objects, valid only until
     // the build (Complete() for a deferred one) is done, and reset then (forgetDeferredInputs).
     CompiledShader deferredCompute{};

@@ -7,8 +7,15 @@
 
 namespace ShaderRecompiler {
 
+struct MaterializedBindings {
+    std::vector<DescriptorBinding> bindings;
+    std::vector<std::byte> pushConstants;
+};
+
 class DescriptorBindingBuilder {
 public:
+    void Prepare(BindingAllocationResult& allocation, const ShaderInfo& info, IrShaderStage stage) const;
+    [[nodiscard]] MaterializedBindings Materialize(const BindingAllocationResult& allocation, const ShaderInfo& info, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const;
     void Populate(BindingAllocationResult& allocation, const IrProgram& program, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const;
     void Populate(BindingAllocationResult& allocation, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const;
 };

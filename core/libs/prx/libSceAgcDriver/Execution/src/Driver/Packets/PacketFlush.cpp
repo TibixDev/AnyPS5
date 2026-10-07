@@ -7,7 +7,37 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket) {
+namespace {
+class MaintenanceTimer {
+public:
+    explicit MaintenanceTimer(PacketMaintenance* profile) : profile(profile) {
+        if (profile != nullptr) {
+            started = std::chrono::steady_clock::now();
+            ++profile->phases[phase].first;
+        }
+    }
+    ~MaintenanceTimer() { finish(); }
+    void Enter(PacketMaintenance::Phase next) {
+        if (profile == nullptr) return;
+        finish();
+        phase = next;
+        ++profile->phases[phase].first;
+    }
+private:
+    void finish() {
+        if (profile == nullptr) return;
+        const auto now = std::chrono::steady_clock::now();
+        profile->phases[phase].second += std::chrono::duration<double, std::milli>(now - started).count();
+        started = now;
+    }
+    PacketMaintenance* profile;
+    PacketMaintenance::Phase phase = PacketMaintenance::Policy;
+    std::chrono::steady_clock::time_point started{};
+};
+}
+
+void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket, PacketMaintenance* timing) {
+    MaintenanceTimer timer(timing);
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
     static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
     static std::atomic<std::uint64_t> packetFlushes{0}, deadlineFlushes{0}, capFlushes{0}, boundaryReaps{0}, overdueLocks{0};
@@ -51,6 +81,10 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     }
     if (reap) lastReapTry = now;
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    struct BeforeUnlock {
+        MaintenanceTimer& timer;
+        ~BeforeUnlock() { timer.Enter(PacketMaintenance::Retire); }
+    } beforeUnlock{timer};
 
     if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     else if (submit || capped) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
@@ -64,6 +98,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     } else if (deferredDue || (queue == 0 && (capped || (submit && (!selfLocking || pendingDue))))) {
         outright = true;
     }
+    timer.Enter(PacketMaintenance::Lock);
     if (outright) {
         gpuLock.lock();
     } else if (!gpuLock.try_lock()) {
@@ -72,22 +107,29 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         else if (selfLocking && submit) ++packetSubmitDeferred;
         return;
     }
+    timer.Enter(PacketMaintenance::Policy);
     const auto localDevice = device.Load();
     if (record || recordAtLock) {
+        timer.Enter(PacketMaintenance::Labels);
         recordDeferredLabels(localDevice.get(), queue);
 
         if ((!labelPacket && packetFlush) || deferredDue) submit = true;
+        timer.Enter(PacketMaintenance::Policy);
     }
     if (localDevice == nullptr) return;
     if (submit || capped) {
 
         if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
+        timer.Enter(PacketMaintenance::Submit);
         localDevice->SubmitRecorded(queue == 0);
+        timer.Enter(PacketMaintenance::Policy);
         if (capped) ++capFlushes;
         else if (!labelPacket && packetFlush) ++packetFlushes;
         else ++deadlineFlushes;
     } else if (reap) {
+        timer.Enter(PacketMaintenance::Reap);
         localDevice->ReapRecorded();
+        timer.Enter(PacketMaintenance::Policy);
         ++boundaryReaps;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

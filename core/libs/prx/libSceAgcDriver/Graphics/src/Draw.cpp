@@ -610,7 +610,7 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
                 const auto size = descriptor.GetSize();
                 if (size == 0 || address == 0) continue;
                 const auto element = offset / 4;
-                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                const bool written = element >= binding.Usage().bufferWritten.size() || binding.Usage().bufferWritten[element];
                 Require(!overlap(address, size, target.address, target.bytes), "shader buffer aliases the render target");
                 Require(!written || !overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
             }
@@ -759,7 +759,7 @@ struct DrawInputs {
     std::uint64_t indexBytes = 0;
     std::shared_ptr<Buffer> indices;
     std::uint32_t maxIndex = 0;
-    VertexInputLayout vertexInput;
+    std::shared_ptr<const VertexInputLayout> vertexInput;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
@@ -863,8 +863,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
-    if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
-    else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    if (recipe != nullptr) {
+        inputs.vertexInput = recipe->vertexInput;
+        ValidateVertexAddresses(attributes, *inputs.vertexInput);
+    } else if (context.vertexInputs != nullptr) inputs.vertexInput = context.vertexInputs->Get(shaders.front().program->variantId, attributes);
+    else inputs.vertexInput = std::make_shared<const VertexInputLayout>(BuildVertexInputLayout(context, attributes));
     inputs.vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
     if (draw.indexed) {
@@ -1708,7 +1711,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
     const State& pipelineState = masked.has_value() ? *masked : state;
-    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    auto pipeline = CachedPipeline(context, pipelineState, *inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;

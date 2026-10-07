@@ -16,6 +16,7 @@ struct SharedBackingSlice {
     std::size_t bytes;
 };
 using SharedBackingResolver = bool (*)(std::uintptr_t address, std::size_t bytes, std::vector<SharedBackingSlice>& slices);
+using SharedBackingWriter = bool (*)(std::uintptr_t address, const void* source, std::size_t bytes);
 #endif
 
 extern "C" {
@@ -42,6 +43,8 @@ void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaUnmapAlias_nid_postfix(void* alias);
 #else
 void GuestArenaSetSharedBacking_nid_postfix(SharedBackingResolver resolver);
+void GuestArenaSetSharedBackingWriter_nid_postfix(SharedBackingWriter writer);
+bool GuestArenaWriteSharedBacking_nid_postfix(std::uintptr_t address, const void* source, std::size_t bytes);
 bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 bool GuestArenaSharedBackings_nid_postfix(std::uintptr_t address, std::size_t bytes, std::vector<SharedBackingSlice>& slices);
 #endif

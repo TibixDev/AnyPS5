@@ -139,6 +139,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferCache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindingPlan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
@@ -240,6 +242,16 @@ target_link_libraries(agc_driver_tests PRIVATE
 set_target_properties(agc_driver_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_tests)
 
+add_test_executable(agc_driver_draw_plan_tests EXCLUDE_FROM_ALL tests/DrawPlan.cpp)
+target_include_directories(agc_driver_draw_plan_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+)
+target_link_libraries(agc_driver_draw_plan_tests PRIVATE libSceAgcDriver libkernel libc)
+set_target_properties(agc_driver_draw_plan_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_draw_plan_tests)
+
 add_test_executable(agc_driver_recompiler_tests EXCLUDE_FROM_ALL
         tests/Recompiler.cpp
 )
@@ -265,6 +277,39 @@ target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
+
+add_test_executable(agc_shared_write_tests EXCLUDE_FROM_ALL tests/SharedWrites.cpp)
+target_include_directories(agc_shared_write_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_shared_write_tests PRIVATE libSceAgcDriver libkernel libc)
+set_target_properties(agc_shared_write_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_shared_write_tests)
+
+add_test_executable(agc_vertex_input_tests EXCLUDE_FROM_ALL tests/VertexInput.cpp)
+target_include_directories(agc_vertex_input_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_vertex_input_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_vertex_input_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_vertex_input_tests)
+
+add_test_executable(agc_vertex_stage_tests EXCLUDE_FROM_ALL tests/VertexStage.cpp)
+target_include_directories(agc_vertex_stage_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_vertex_stage_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_vertex_stage_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_vertex_stage_tests)
+
+add_test_executable(agc_result_memo_tests EXCLUDE_FROM_ALL tests/ResultMemo.cpp)
+target_link_libraries(agc_result_memo_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_result_memo_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_result_memo_tests)
+
+add_test_executable(agc_binding_materialization_tests EXCLUDE_FROM_ALL tests/BindingMaterialization.cpp)
+target_link_libraries(agc_binding_materialization_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_binding_materialization_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_binding_materialization_tests)
+
+add_test_executable(agc_srt_execution_tests EXCLUDE_FROM_ALL tests/SrtExecution.cpp)
+target_link_libraries(agc_srt_execution_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_srt_execution_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_srt_execution_tests)
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
@@ -414,12 +459,29 @@ add_custom_command(
         VERBATIM
 )
 
+foreach(agcTriangleStage IN ITEMS vert frag)
+    set(agcTriangleSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/Triangle.${agcTriangleStage})
+    set(agcTriangleSpv ${agcTestShaderGeneratedRoot}/Triangle_${agcTriangleStage}.spv)
+    set(agcTriangleHeader ${agcTestShaderGeneratedRoot}/Triangle_${agcTriangleStage}_spv.h)
+    add_custom_command(
+            OUTPUT "${agcTriangleHeader}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcTriangleSpv}" "${agcTriangleSource}"
+            COMMAND ${CMAKE_COMMAND} -DINPUT=${agcTriangleSpv} -DOUTPUT=${agcTriangleHeader}
+            -DSYMBOL=TRIANGLE_${agcTriangleStage}_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+            DEPENDS "${agcTriangleSource}" glslang-standalone
+            VERBATIM
+    )
+    list(APPEND agcTriangleHeaders "${agcTriangleHeader}")
+endforeach()
+
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/ResidentPresent.cpp
         ${agcSampleLodShaderHeader}
         ${agcSampleArrayHeaders}
         ${agcBufferUpdateHeader}
+        ${agcTriangleHeaders}
 )
 
 target_include_directories(agc_driver_recorder_tests PRIVATE
@@ -473,6 +535,8 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/ColorTargetLayout.cpp
         Graphics/src/ColorTargetTransfer.cpp
         Graphics/src/Resources.cpp
+        Graphics/src/BufferCache.cpp
+        Graphics/src/BindingPlan.cpp
         Graphics/src/ShaderResources.cpp
         Graphics/src/ShaderAddressResources.cpp
         Graphics/src/GuestBufferMemory.cpp
@@ -568,7 +632,7 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
 endforeach()
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_structurizer_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests ${agcExecutionTests})
+    foreach(agcTest IN ITEMS agc_vertex_stage_tests agc_shared_write_tests agc_vertex_input_tests agc_driver_tests agc_driver_draw_plan_tests agc_shader_memory_tests agc_result_memo_tests agc_binding_materialization_tests agc_srt_execution_tests agc_structurizer_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests ${agcExecutionTests})
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
@@ -622,6 +686,8 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/Pipeline.cpp
             Graphics/src/PipelineCache.cpp
             Graphics/src/Resources.cpp
+            Graphics/src/BufferCache.cpp
+            Graphics/src/BindingPlan.cpp
             Graphics/src/ShaderResources.cpp
             Graphics/src/ShaderAddressResources.cpp
             Graphics/src/GuestBufferMemory.cpp
