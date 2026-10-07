@@ -1294,6 +1294,12 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) return entry;
+        const auto lease = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(address, bytes);
+        if (!importsStale(context, state)) {
+            if (lease.empty()) return nullptr;
+            const auto& range = *lease.front();
+            return importAllocation(context, state, range.address, range.bytes, lease);
+        }
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
@@ -1302,9 +1308,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    return containingRange(lease, address, address + bytes) != nullptr;
+    return !GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(address, bytes).empty();
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
