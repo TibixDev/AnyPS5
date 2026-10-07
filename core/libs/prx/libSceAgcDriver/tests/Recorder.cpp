@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -2545,6 +2546,37 @@ void expectRed(float got, float want, const char* what) {
     if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string(what) + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
 }
 
+void depthClearPassTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    DepthTarget target{0x10000, 0x20000, {64, 64}, VK_FORMAT_D32_SFLOAT_S8_UINT, 0.25f, 19};
+    struct Release {
+        const Context& context;
+        ~Release() { ClearDepthSurfaces(context.device); }
+    } release{context};
+    RunDepthClearPass(context, {target, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT});
+    GuestTextureResource resource{};
+    resource.baseAddress = target.address;
+    resource.width = 64;
+    resource.height = 64;
+    resource.mipCount = 1;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 22;
+    const std::array<std::uint32_t, 8> words{};
+    const VkComponentMapping mapping{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    const auto texture = DepthSurfaceTexture(context, words, resource, mapping);
+    Require(texture != nullptr, "depth clear did not create a sampleable surface");
+    SampleProgram program(context, recorder);
+    expectRed(program.Red(texture->View(), texture->Layout(), 0.0f), 0.25f, "initial depth clear");
+    target.clearDepth = 0.75f;
+    RunDepthClearPass(context, {target, VK_IMAGE_ASPECT_DEPTH_BIT});
+    expectRed(program.Red(texture->View(), texture->Layout(), 0.0f), 0.75f, "repeated depth clear kept old depth");
+    target.clearDepth = 0.0f;
+    target.clearStencil = 47;
+    RunDepthClearPass(context, {target, VK_IMAGE_ASPECT_STENCIL_BIT});
+    expectRed(program.Red(texture->View(), texture->Layout(), 0.0f), 0.75f, "stencil-only clear changed depth");
+    recorder.Sync();
+}
+
 void minLodTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (!context.imageViewMinLod) {
@@ -2793,6 +2825,11 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-clear-only") {
+            depthClearPassTests(device, recorder);
+            std::cout << "Resident depth clear sampling and aspect preservation tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
             cmaskPassTests(device, recorder);
             std::cout << "CMASK resident clear and copy write-back tests passed\n";
@@ -2834,6 +2871,7 @@ int main(int argc, char** argv) {
         atomicViewTests(device, recorder);
         metadataPassTests(device, recorder);
         cmaskPassTests(device, recorder);
+        depthClearPassTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
         sampleDumpTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
