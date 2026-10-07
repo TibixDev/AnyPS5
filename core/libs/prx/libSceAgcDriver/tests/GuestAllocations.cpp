@@ -32,6 +32,7 @@ void targetedLeaseTests() {
     std::array<std::byte, 320> memory{};
     const auto base = reinterpret_cast<std::uintptr_t>(memory.data());
     using GuestAllocations::GuestAllocationsAcquireRange_nid_postfix;
+    using GuestAllocations::GuestAllocationsAcquireSpan_nid_postfix;
     {
         GuestAllocations::Mutation mutation;
         mutation.Add(memory.data(), 64, true, true);
@@ -47,6 +48,17 @@ void targetedLeaseTests() {
     Require(GuestAllocationsAcquireRange_nid_postfix(base + 128, 1).empty(), "unreadable memory acquired a lease");
     Require(GuestAllocationsAcquireRange_nid_postfix(base + 192, 1).empty(), "an allocation gap acquired a lease");
     Require(GuestAllocationsAcquireRange_nid_postfix(base + 320, 1).empty(), "a range past the allocation acquired a lease");
+    Require(GuestAllocationsAcquireSpan_nid_postfix(0, 1).empty() && GuestAllocationsAcquireSpan_nid_postfix(base, 0).empty(), "an empty span acquired a lease");
+    Require(GuestAllocationsAcquireSpan_nid_postfix(std::numeric_limits<std::uintptr_t>::max() - 1, 4).empty(), "an overflowing span acquired a lease");
+    Require(GuestAllocationsAcquireSpan_nid_postfix(base + 16, 113).empty(), "a span crossed into unreadable memory");
+    Require(GuestAllocationsAcquireSpan_nid_postfix(base + 192, 65).empty(), "a span skipped an allocation gap");
+    {
+        const auto span = GuestAllocationsAcquireSpan_nid_postfix(base + 16, 112);
+        Require(span.size() == 2 && span[0]->address == base && span[1]->address == base + 64 && !span[1]->writable, "a span lost one of its adjacent allocations");
+        GuestAllocations::Mutation mutation;
+        reject([&] { mutation.Remove(memory.data()); });
+        reject([&] { mutation.Remove(memory.data() + 64); });
+    }
     {
         const auto readOnly = GuestAllocationsAcquireRange_nid_postfix(base + 64, 64);
         Require(readOnly.size() == 1 && !readOnly.front()->writable, "a read-only lease lost its protection");

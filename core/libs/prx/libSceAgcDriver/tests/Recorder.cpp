@@ -239,6 +239,7 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
     Require(context.hostImportAlignment != 0, "shared import tests require host import support");
     const auto bytes = static_cast<std::size_t>(std::max<VkDeviceSize>(65536, context.hostImportAlignment));
     Buffer readback(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer combinedReadback(context, bytes * 3, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     struct Release {
         const Context& context;
         Recorder& recorder;
@@ -312,7 +313,118 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
     Require(HostImportFor(refused, address, bytes) == nullptr, "forced import failure was ignored");
     Require(sceKernelMapDirectMemory(&release.mappings[2], bytes, 3, 0x10, release.physical[1], bytes) == 0, "remap after a refused import");
     read(import(), std::byte{0x77});
+#ifndef _WIN32
+    void* middle = original + bytes;
+    Require(sceKernelMapDirectMemory(&middle, bytes, 3, 0x10, release.physical[1], bytes) == 0, "split the combined import across two backings");
+    const auto combinedAddress = reinterpret_cast<std::uint64_t>(original);
+    const auto* narrow = HostImportFor(context, combinedAddress, bytes);
+    Require(narrow != nullptr, "import the first fragment before combining it");
+    const auto narrowBuffer = narrow->buffer;
+    const auto narrowSerial = HostImportSerial(context, combinedAddress, bytes, false);
+    const auto readCombined = [&](const HostImport& imported, const std::array<std::byte, 3>& expected) {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        CopyBuffer(context, commands, imported.buffer, combinedAddress - imported.base, combinedReadback.Handle(), 0, bytes * 3);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        for (std::size_t i = 0; i < bytes * 3; ++i) Require(combinedReadback.Bytes()[i] == expected[i / bytes], "combined import read the wrong backing at a boundary");
+    };
+    const auto* combined = HostImportFor(context, combinedAddress, bytes * 3);
+    Require(combined != nullptr && combined->buffer != narrowBuffer, "a combined import reused an undersized buffer");
+    Require(narrow->buffer == narrowBuffer, "combining ranges retired an existing overlapping import");
+    Require(!narrow->shadowAllowed && !combined->shadowAllowed, "overlapping imports retained independent unit shadows");
+    const auto combinedSerial = HostImportSerial(context, combinedAddress, bytes * 3, false);
+    readCombined(*combined, {std::byte{0x11}, std::byte{0x77}, std::byte{0x33}});
+    {
+        GuestBufferMemory buffers(context);
+        buffers.AddReadable(combinedAddress, bytes * 3);
+        buffers.Upload(false);
+        std::uint32_t adjustment = 0;
+        Require(buffers.Descriptor(combinedAddress, bytes * 3, adjustment).buffer == combined->buffer && buffers.DirectRegions().has_value(), "fragmented memory still fell back to CPU copies");
+    }
+    const auto combinedCommands = recorder.Commands();
+    RecordMemoryBarrier(context, combinedCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(combinedCommands, combined->buffer, bytes - 4, bytes + 8, 0x99999999);
+    RecordMemoryBarrier(context, combinedCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Sync();
+    for (std::size_t i = 0; i < bytes * 3; ++i) {
+        const auto expected = i < bytes - 4 ? std::byte{0x11} : i < bytes * 2 + 4 ? std::byte{0x99} : std::byte{0x33};
+        Require(original[i] == expected, "GPU write failed across combined backing boundaries");
+    }
+    Require(std::all_of(static_cast<std::byte*>(release.mappings[1]), static_cast<std::byte*>(release.mappings[1]) + bytes, [](std::byte value) { return value == std::byte{0x99}; }), "combined GPU writes missed the second backing's alias");
+    Require(sceKernelMapDirectMemory(&middle, bytes, 3, 0x10, release.physical[0] + bytes, bytes) == 0, "remap the middle of a combined import");
+    const auto* replaced = HostImportFor(context, combinedAddress, bytes * 3);
+    Require(replaced != nullptr && HostImportSerial(context, combinedAddress, bytes * 3, false) != combinedSerial, "middle remap retained the combined import identity");
+    Require(narrow->buffer == narrowBuffer && narrow->serial == narrowSerial, "middle remap invalidated an unrelated fragment import");
+    std::memset(original, 0x11, bytes);
+    std::memset(original + bytes * 2, 0x33, bytes);
+    readCombined(*replaced, {std::byte{0x11}, std::byte{0x55}, std::byte{0x33}});
+#endif
     std::cout << "Shared import roundtrip, direct binding, remap and failure recovery tests passed (" << (first.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "dma-buf" : "host pointer") << ")\n";
+}
+
+void combinedShadowTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    using namespace AgcDriver::GuestMemory;
+    if (!UnitShadowEnabled()) {
+        std::cout << "Unit shadows unavailable: combined import shadow test skipped\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    const auto bytes = static_cast<std::size_t>(std::max<VkDeviceSize>(65536, context.hostImportAlignment));
+    Buffer readback(context, bytes * 3, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    void* block = AllocateWatched(bytes * 3, bytes);
+    Require(block != nullptr, "allocate watched combined-shadow memory");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::size_t bytes;
+        ~Release() {
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                for (std::size_t i = 0; i < 3; ++i) mutation.Remove(static_cast<std::byte*>(block) + i * bytes);
+            }
+            static_cast<void>(HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes * 3));
+            recorder.Sync();
+            ReleaseWatched(block, bytes * 3);
+        }
+    } release{context, recorder, block, bytes};
+    {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t i = 0; i < 3; ++i) mutation.Add(static_cast<std::byte*>(block) + i * bytes, bytes, true, true);
+    }
+    std::memset(block, 0x11, bytes * 3);
+    const auto* narrow = HostImportFor(context, address + bytes, bytes);
+    Require(narrow != nullptr, "import narrow shadow memory");
+    if (!Watched(address + bytes, bytes)) {
+        std::cout << "Imports unwatch memory: combined import shadow test skipped\n";
+        return;
+    }
+    CollectWritesUncached(address, bytes * 3);
+    auto destination = ShadowDestinationFor(context, *narrow, address + bytes, address + bytes * 2);
+    Require(destination.has_value(), "make an unpublished narrow shadow");
+    auto commands = recorder.Commands();
+    recorder.Keep(destination->slab);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, destination->buffer, destination->offset, bytes, 0x77777777);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const ShadowedRange range{address + bytes, address + bytes * 2, destination->slab};
+    MarkShadowed(*narrow, std::span(&range, 1), TrackerGeneration());
+    Require(AnyShadowedOverlaps(address + bytes, bytes), "the narrow shadow was not pending");
+    const auto* combined = HostImportFor(context, address, bytes * 3);
+    Require(combined != nullptr && !combined->shadowAllowed && !narrow->shadowAllowed, "combined import retained competing shadows");
+    Require(!AnyShadowedOverlaps(address, bytes * 3), "combining imports left an unpublished shadow");
+    Require(!ShadowDestinationFor(context, *narrow, address + bytes, address + bytes * 2).has_value(), "old narrow resources can still make a competing shadow");
+    commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    CopyBuffer(context, commands, combined->buffer, 0, readback.Handle(), 0, bytes * 3);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Sync();
+    for (std::size_t i = 0; i < bytes * 3; ++i) Require(readback.Bytes()[i] == (i >= bytes && i < bytes * 2 ? std::byte{0x77} : std::byte{0x11}), "combined import lost unpublished narrow-shadow data");
+    std::cout << "Combined import preserves unpublished narrow-shadow data\n";
+#endif
 }
 
 void readTrackingTests(const Device& device, Recorder& recorder) {
@@ -3346,6 +3458,7 @@ int main(int argc, char** argv) {
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--shared-import-only") {
             sharedImportTests(device, recorder);
+            combinedShadowTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--depth-array-failure-only") {

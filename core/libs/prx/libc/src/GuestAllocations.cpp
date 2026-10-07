@@ -424,4 +424,23 @@ Lease GuestAllocationsAcquireRange_nid_postfix(std::uintptr_t address, std::size
     return {range};
 }
 
+Lease GuestAllocationsAcquireSpan_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return {};
+    std::lock_guard lock(registry().mutex);
+    const auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(address);
+    if (it == ranges.begin()) return {};
+    --it;
+    Lease result;
+    const auto end = address + bytes;
+    for (auto cursor = address; cursor < end; ++it) {
+        if (it == ranges.end() || it->first > cursor) return {};
+        const auto& range = it->second;
+        if (!range->readable || cursor - range->address >= range->bytes) return {};
+        result.push_back(range);
+        cursor = range->address + range->bytes;
+    }
+    return result;
+}
+
 }
