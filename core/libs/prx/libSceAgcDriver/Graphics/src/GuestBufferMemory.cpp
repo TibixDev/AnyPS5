@@ -36,6 +36,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace AgcDriver::Graphics {
 
@@ -123,9 +124,19 @@ struct HostImports {
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     using Key = std::pair<std::uint64_t, std::uint64_t>;
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const noexcept {
+            return std::hash<std::uint64_t>{}(key.first ^ std::rotl(key.second, 32));
+        }
+    };
     std::map<Key, std::shared_ptr<HostImport>> imports;
     std::shared_ptr<std::atomic<std::uint64_t>> liveBytes = std::make_shared<std::atomic<std::uint64_t>>(0);
     std::map<Key, std::vector<std::weak_ptr<const GuestAllocations::Range>>> failed;
+    std::unordered_set<Key, KeyHash> failedSpans;
+    void RecordFailure(const Key& key, const std::vector<std::weak_ptr<const GuestAllocations::Range>>& ranges) {
+        const auto entry = failed.emplace(key, ranges).first;
+        if (entry->second.size() > 1) failedSpans.insert(key);
+    }
     std::uint64_t maxImportBytes = 0;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
@@ -354,7 +365,7 @@ std::shared_ptr<HostImport> importAllocation(const Context& context, HostImports
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-            state.failed.emplace(key, entry.ranges);
+            state.RecordFailure(key, entry.ranges);
             return nullptr;
         }
         const auto protection = info.Protect & 0xffu;
@@ -366,7 +377,7 @@ std::shared_ptr<HostImport> importAllocation(const Context& context, HostImports
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) {
-        state.failed.emplace(key, entry.ranges);
+        state.RecordFailure(key, entry.ranges);
         return nullptr;
     }
     if (!writable) {
@@ -389,7 +400,7 @@ std::shared_ptr<HostImport> importAllocation(const Context& context, HostImports
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
-        state.failed.emplace(key, entry.ranges);
+        state.RecordFailure(key, entry.ranges);
         std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -487,6 +498,7 @@ void refreshImports(const Context& context, HostImports& state) {
         state.imports.clear();
         state.liveBytes = std::make_shared<std::atomic<std::uint64_t>>(0);
         state.failed.clear();
+        state.failedSpans.clear();
         state.maxImportBytes = 0;
         state.device = context.device;
         state.refreshedGeneration = 0;
@@ -518,7 +530,11 @@ void refreshImports(const Context& context, HostImports& state) {
         it = next;
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) {
-        it = ownersCurrent(it->second) ? std::next(it) : state.failed.erase(it);
+        if (ownersCurrent(it->second)) ++it;
+        else {
+            state.failedSpans.erase(it->first);
+            it = state.failed.erase(it);
+        }
     }
     state.refreshedGeneration = generation;
 }
@@ -539,10 +555,9 @@ bool importsStale(const Context& context, const HostImports& state) {
 }
 
 bool knownImportFailure(const Context& context, const HostImports& state, std::uint64_t begin, std::uint64_t end) {
-    const auto [first, last] = importBounds(context, begin, end);
-    if (first < last) {
-        const auto exact = state.failed.find({first, last - first});
-        if (exact != state.failed.end() && exact->second.size() > 1) return true;
+    if (!state.failedSpans.empty()) {
+        const auto [first, last] = importBounds(context, begin, end);
+        if (first < last && state.failedSpans.contains({first, last - first})) return true;
     }
     auto found = state.failed.upper_bound({begin, std::numeric_limits<std::uint64_t>::max()});
     if (found == state.failed.begin()) return false;
@@ -1283,6 +1298,7 @@ void ClearHostImports(VkDevice device) {
     if (state.device != device) return;
     state.imports.clear();
     state.failed.clear();
+    state.failedSpans.clear();
     state.maxImportBytes = 0;
     state.refreshedGeneration = 0;
     state.device = VK_NULL_HANDLE;

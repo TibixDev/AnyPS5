@@ -1793,7 +1793,7 @@ void failedImportTests(const Device& device) {
     std::cout << "Import failures preserve allocation boundaries, replacement identities, protection splits and device-cache clearing\n";
 }
 
-void importRangeBenchmark(const Device& device) {
+void importRangeBenchmark(const Device& device, std::size_t failures = 0) {
     std::thread establishThreadedProcess([] {});
     establishThreadedProcess.join();
     auto context = device.GetContext();
@@ -1804,30 +1804,44 @@ void importRangeBenchmark(const Device& device) {
     ClearHostImports(context.device);
     constexpr std::size_t unit = 2u << 20u;
     constexpr std::size_t count = 17;
-    void* memory = AllocateWatched(unit * count, 65536);
+    const auto prefixBytes = failures * 65536;
+    void* memory = AllocateWatched(prefixBytes + unit * count, 65536);
     Require(memory != nullptr, "import range benchmark requires watched memory");
     {
         GuestAllocations::Mutation mutation;
-        for (std::size_t i = 0; i < count; ++i) mutation.Add(static_cast<std::byte*>(memory) + i * unit, unit, true, true);
+        for (std::size_t i = 0; i < failures; ++i) mutation.Add(static_cast<std::byte*>(memory) + i * 65536, 65536, true, true);
+        for (std::size_t i = 0; i < count; ++i) mutation.Add(static_cast<std::byte*>(memory) + prefixBytes + i * unit, unit, true, true);
     }
     struct Cleanup {
         const Context& context;
         void* memory;
+        std::size_t failures;
+        std::size_t prefixBytes;
         ~Cleanup() {
             ClearHostImports(context.device);
             {
                 GuestAllocations::Mutation mutation;
-                for (std::size_t i = 0; i < count; ++i) mutation.Remove(static_cast<std::byte*>(memory) + i * unit);
+                for (std::size_t i = 0; i < failures; ++i) mutation.Remove(static_cast<std::byte*>(memory) + i * 65536);
+                for (std::size_t i = 0; i < count; ++i) mutation.Remove(static_cast<std::byte*>(memory) + prefixBytes + i * unit);
             }
-            ReleaseWatched(memory, unit * count);
+            ReleaseWatched(memory, prefixBytes + unit * count);
         }
-    } cleanup{context, memory};
+    } cleanup{context, memory, failures, prefixBytes};
+    for (std::size_t i = 0; i < failures; ++i) Require(HostImportFor(context, reinterpret_cast<std::uint64_t>(memory) + i * 65536, 256) == nullptr, "forced background import succeeded");
     for (const std::size_t bytes : {std::size_t{256}, std::size_t{16711680}, std::size_t{33423360}}) {
         std::array<double, 9> times;
-        const auto address = reinterpret_cast<std::uint64_t>(memory) + 0xc0000;
+        std::vector<std::uint64_t> addresses;
+        const bool small = failures != 0 && bytes == 256;
+        const auto queries = failures == 0 ? 1u : small ? failures : 16u;
+        const auto first = reinterpret_cast<std::uint64_t>(memory) + (small ? 4 : prefixBytes + 0xc0000);
+        for (std::size_t i = 0; i < queries; ++i) {
+            const auto address = first + i * 65536;
+            addresses.push_back(address);
+            Require(HostImportFor(context, address, bytes) == nullptr, "forced benchmark import succeeded");
+        }
         for (unsigned pass = 0; pass <= times.size(); ++pass) {
             const auto started = std::chrono::steady_clock::now();
-            for (unsigned i = 0; i < 65536; ++i) Require(HostImportFor(context, address, bytes) == nullptr, "forced failed import succeeded");
+            for (unsigned i = 0; i < 65536; ++i) Require(HostImportFor(context, addresses[(i * 509u) % addresses.size()], bytes) == nullptr, "forced failed import succeeded");
             if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - started).count() / 65536;
         }
         std::ranges::sort(times);
@@ -4857,6 +4871,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-import-ranges") {
             importRangeBenchmark(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-import-index") {
+            importRangeBenchmark(device, 512);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-import-mappings") {
