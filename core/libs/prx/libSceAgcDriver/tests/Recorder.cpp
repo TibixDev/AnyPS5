@@ -4033,7 +4033,6 @@ int main(int argc, char** argv) {
         unchangedSinceTests();
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
-        cmaskValidationTests(device, recorder);
         resourceReadTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
@@ -4067,6 +4066,7 @@ int main(int argc, char** argv) {
         pendingKeyStoreTests(device, recorder);
         sampleDumpTests(device, recorder);
         copiedDirectOrderingTests(device, recorder);
+        cmaskValidationTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {
