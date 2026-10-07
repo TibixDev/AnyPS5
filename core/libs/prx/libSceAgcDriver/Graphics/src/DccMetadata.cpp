@@ -378,6 +378,25 @@ std::size_t DccKeyBytes(std::uint64_t surfaceBytes) {
     return static_cast<std::size_t>(surfaceBytes / KeyBytes);
 }
 
+std::size_t CmaskKeyBytes(std::uint32_t width, std::uint32_t height) {
+    Require(width != 0 && width <= 16384 && height != 0 && height <= 16384, "invalid CMASK surface extent");
+    return static_cast<std::size_t>((width + 1023u) / 1024u) * ((height + 511u) / 512u) * 4096u;
+}
+
+bool CmaskIsClear(std::uint64_t metaAddress, std::size_t keyBytes) {
+    Require(metaAddress != 0 && keyBytes != 0, "invalid CMASK metadata range");
+    std::vector<std::uint8_t> keys(keyBytes);
+    GuestMemory::Read(metaAddress, std::as_writable_bytes(std::span(keys)), 256);
+    Require((keys[0] == 0 || keys[0] == 0xff) && AllKeysEqual(keys.data(), keys.size(), keys[0]), "CMASK contains mixed or unsupported per-block metadata");
+    return keys[0] == 0;
+}
+
+void MarkCmaskExpanded(std::uint64_t metaAddress, std::size_t keyBytes) {
+    Require(metaAddress != 0 && keyBytes != 0, "invalid CMASK metadata range");
+    const std::vector<std::byte> keys(keyBytes, std::byte{0xff});
+    GuestMemory::Write(metaAddress, keys, 256);
+}
+
 namespace {
 
 // ReadDccKeys, saying in `memoized` whether the answer came from the pending-store memo rather

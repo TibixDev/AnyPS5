@@ -125,6 +125,25 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
     resident.Refresh();
 }
 
+void materializeCmaskClear(const ColorTarget& color, StorageTexture* resident) {
+    if (color.cmaskAddress == 0) return;
+    const auto keyBytes = CmaskKeyBytes(color.extent.width, color.extent.height);
+    if (!CmaskIsClear(color.cmaskAddress, keyBytes)) return;
+    const auto texel = clearTexel(color, DccKeys::ClearRegister);
+    const char* refusal = nullptr;
+    if (resident != nullptr && clearToTexel(*resident, texel, color.elementBytes, refusal)) {
+        MarkCmaskExpanded(color.cmaskAddress, keyBytes);
+        return;
+    }
+    StorageTexture::FlushPending(color.address, color.bytes, nullptr, "CMASK fast-clear materialization");
+    const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
+    std::vector<std::byte> texels(color.bytes);
+    for (std::size_t offset = 0; offset + elementBytes <= texels.size(); offset += elementBytes) std::memcpy(texels.data() + offset, texel.data(), elementBytes);
+    GuestMemory::Write(color.address, texels);
+    MarkCmaskExpanded(color.cmaskAddress, keyBytes);
+    if (resident != nullptr) resident->Refresh();
+}
+
 void imageBarrier(const Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) {
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.srcAccessMask = sourceAccess;
@@ -895,6 +914,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
+    if (resident != nullptr) materializeCmaskClear(color, resident.get());
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -1529,6 +1549,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         Require(!color.mipTail, "rendering into a packed mip tail needs the resident image of its surface");
         Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
+        materializeCmaskClear(color, nullptr);
         if (binding.gpuTiling) {
             binding.mip = ColorTargetMip(color, colorLayout);
             binding.tiled = std::make_unique<Buffer>(context, colorLayout.Bytes(), copies);
@@ -2069,6 +2090,20 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {
     for (const auto& color : pass.targets) {
+        if (color.cmaskAddress != 0) {
+            Require(pass.mode == ColorMetadataPass::Mode::EliminateFastClear, "CMASK metadata requires fast-clear elimination");
+            std::shared_ptr<StorageTexture> resident;
+            if ((color.tileMode == ColorTileMode::RenderTarget || color.tileMode == ColorTileMode::Standard4KB) && context.detiler != nullptr) {
+                try {
+                    resident = CachedStorageSurface(context, SurfaceForTarget(color));
+                } catch (const std::exception&) {
+                    resident = nullptr;
+                }
+                if (resident != nullptr && resident->GuestBytes() != color.bytes) resident = nullptr;
+            }
+            materializeCmaskClear(color, resident.get());
+            continue;
+        }
         if (color.dccAddress == 0) continue;
         auto keys = CurrentDccKeys(color.dccAddress, color.bytes);
         if (keys == DccKeys::Uncompressed) continue;
