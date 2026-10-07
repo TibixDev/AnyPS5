@@ -2843,6 +2843,70 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     Require(words[0] == (begin | ready) && recorder.SamplesTotal() == begin, "dumps past one batch's query slots moved the total");
 }
 
+void cmaskValidationTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    constexpr std::size_t keyBytes = 4096;
+    void* block = AllocateWatched(bytes, bytes);
+    if (block == nullptr) {
+        std::cout << "no write watching: CMASK validation reuse not tested\n";
+        return;
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Release {
+        const Context& context;
+        void* block;
+        ~Release() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+            ReleaseWatched(block, bytes);
+        }
+    } release{context, block};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::memset(block, 0, bytes);
+    BumpCollectEpoch();
+    Require(CmaskIsClear(address, keyBytes) && CmaskIsClear(address, keyBytes), "initial CMASK clear was not retained");
+    MarkCmaskExpanded(address, keyBytes);
+    Require(!CmaskIsClear(address, keyBytes) && !CmaskIsClear(address, keyBytes), "driver CMASK expansion was not seen in the same epoch");
+    std::memset(block, 0, keyBytes);
+    BumpCollectEpoch();
+    Require(CmaskIsClear(address, keyBytes), "a CPU CMASK clear retained expanded metadata");
+    std::memset(block, 0xff, keyBytes);
+    BumpCollectEpoch();
+    Require(!CmaskIsClear(address, keyBytes), "expanded CMASK read as clear");
+    bool rejected = false;
+    try {
+        CmaskIsClear(address, keyBytes * 2);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    Require(rejected, "CMASK reuse hid mixed metadata outside the previous range");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Add(block, bytes, true, true);
+    }
+    std::memset(block, 0, keyBytes);
+    Require(CmaskIsClear(address, keyBytes), "CMASK reuse retained metadata across allocation replacement");
+    if (context.hostImportAlignment != 0 && HostImportFor(context, address, bytes) != nullptr) {
+        MarkDccUncompressed(context, address, keyBytes * 256);
+        Require(!CmaskIsClear(address, keyBytes), "CMASK validation did not wait for a queued GPU expansion");
+        recorder.Sync();
+    }
+    Unwatch(address, bytes);
+    std::memset(block, 0xff, keyBytes);
+    Require(!CmaskIsClear(address, keyBytes), "unwatch retained a CMASK proof");
+    std::memset(block, 0, keyBytes);
+    Require(CmaskIsClear(address, keyBytes), "unwatched CMASK changes were not read");
+}
+
 void cmaskPassTests(const Device& device, Recorder& recorder) {
     namespace GuestMemory = AgcDriver::GuestMemory;
     auto context = device.GetContext();
@@ -3919,6 +3983,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
+            cmaskValidationTests(device, recorder);
             cmaskPassTests(device, recorder);
             std::cout << "CMASK resident clear and copy write-back tests passed\n";
             return 0;
@@ -3934,6 +3999,7 @@ int main(int argc, char** argv) {
         unchangedSinceTests();
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
+        cmaskValidationTests(device, recorder);
         resourceReadTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
