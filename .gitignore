@@ -31,6 +31,12 @@
 _SaveData/
 _sd/
 
+# Local Skyrim game dump
+/PPSA03747-app/
+
+# External implementation references
+/references/
+
 build/
 build_tools/
 b/
