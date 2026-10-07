@@ -21,6 +21,7 @@ struct Fixture {
     IrResourcePlan plan;
 
     IrValue& Make(IrOpcode op, IrType type, std::initializer_list<IrValue*> arguments = {}) {
+        require(arguments.size() == IrOpcodeOperandCount(op), "fixture operands disagree with the IR instruction schema");
         auto value = std::make_unique<IrValue>(op, type, static_cast<std::uint32_t>(plan.valueStorage.size()));
         for (auto* argument : arguments) value->AddArgument(argument);
         plan.valueStorage.push_back(std::move(value));
@@ -51,9 +52,11 @@ struct Fixture {
         auto& offset = User(2);
         auto& handle = buffer ? Make(IrOpcode::GetBufferResource, IrType::BufferResource, {&low, &high, &User(3), &User(4)}) : Make(IrOpcode::GetAddressResource, IrType::AddressResource, {&low, &high});
         auto& srt = Make(IrOpcode::GetSrtResource, IrType::SrtResource);
+        auto& active = Make(IrOpcode::Void, IrType::Bool);
+        active.SetImmediateBool(true);
         for (std::uint32_t i = 0; i < descriptors * 8 + 8; ++i) {
             auto& relative = Make(IrOpcode::IAdd32, IrType::U32, {&offset, &Constant(i * 4)});
-            auto& read = Make(buffer ? IrOpcode::ReadConstBuffer : IrOpcode::LoadAddressU32, IrType::U32, {&handle, &relative});
+            auto& read = buffer ? Make(IrOpcode::ReadConstBuffer, IrType::U32, {&handle, &relative}) : Make(IrOpcode::LoadAddressU32, IrType::U32, {&handle, &relative, &Constant(0), &active});
             plan.srtReads.push_back({&read, i});
             if (i >= descriptors * 8) continue;
             if (i % 8 == 0) {
@@ -148,6 +151,14 @@ void correctness() {
     compare(nested, runtime);
     next.ReplaceArgument(0, &nested.Make(IrOpcode::GetAddressResource, IrType::AddressResource, {&next, &nested.Constant(0)}));
     require(Detail::CompileSrtExecutionPlan(nested.plan) == nullptr, "cyclic expression was compiled");
+    for (const bool buffer : {false, true}) {
+        Fixture malformed(buffer, 1);
+        malformed.plan.srtReads.front().value->AddArgument(&malformed.Constant(0));
+        require(Detail::CompileSrtExecutionPlan(malformed.plan) == nullptr, "malformed memory operands selected compiled evaluation");
+    }
+    Fixture generalAddress(false, 1);
+    generalAddress.plan.memoryInfo[0].kind = ResourceKind::Global;
+    require(Detail::CompileSrtExecutionPlan(generalAddress.plan) == nullptr, "non-scalar memory selected scalar descriptor evaluation");
     Fixture large(false, 32);
     compare(large, runtime);
     Fixture arithmetic(false, 1);

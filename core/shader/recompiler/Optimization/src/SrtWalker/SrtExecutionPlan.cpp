@@ -125,7 +125,7 @@ private:
             }
             case IrOpcode::LoadAddressU32:
             case IrOpcode::ReadConstBuffer: {
-                if (!IsRawRead(program, value) || value.ArgumentCount() != 2) return {};
+                if (!IsRawRead(program, value) || value.ArgumentCount() != IrOpcodeOperandCount(operation.opcode)) return {};
                 const auto* handle = value.Argument(0)->Resolve();
                 const bool buffer = operation.opcode == IrOpcode::ReadConstBuffer;
                 if (handle->Opcode() == IrOpcode::Void || handle->ArgumentCount() < 2 || (buffer && handle->ArgumentCount() != 4)) return {};
