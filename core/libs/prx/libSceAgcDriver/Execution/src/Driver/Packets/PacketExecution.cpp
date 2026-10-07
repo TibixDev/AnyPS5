@@ -131,7 +131,7 @@ void Driver::execute(const Submission& submission) {
         }
 
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
+        flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37, profilePackets ? &packetProfile.maintenance : nullptr);
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
 
         if (profilePackets) {

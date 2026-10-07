@@ -210,7 +210,7 @@ private:
     void noteQueuedLabels(std::uint32_t queue);
     void recordQueuedLabelsByTry(std::uint32_t queue, std::atomic<std::uint64_t>& counter);
     static void recordQueuedLabelsFromHook();
-    void flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket);
+    void flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket, PacketMaintenance* timing);
     bool preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump);
     void dumpSampleCounters(std::uint64_t address);
     template <typename TWork>

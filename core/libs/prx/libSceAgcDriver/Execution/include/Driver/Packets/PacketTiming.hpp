@@ -19,12 +19,18 @@ struct WorkerProfile {
     std::chrono::steady_clock::time_point reported = start;
 };
 
+struct PacketMaintenance {
+    enum Phase : std::size_t { Policy, Lock, Labels, Submit, Reap, Retire, Count };
+    std::array<std::pair<std::uint64_t, double>, Count> phases{};
+};
+
 struct PacketProfile {
     std::map<std::uint32_t, std::pair<std::uint64_t, double>> byOpcode;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::uint64_t submissions = 0;
 
     double flushMs = 0;
+    PacketMaintenance maintenance;
 
     std::array<std::pair<std::uint64_t, double>, static_cast<std::size_t>(DispatchOutcome::Count)> dispatchOutcomes{};
 };
