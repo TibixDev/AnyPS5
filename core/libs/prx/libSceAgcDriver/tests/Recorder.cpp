@@ -238,8 +238,10 @@ private:
 using Kind = Recorder::ReadKind;
 
 PFN_vkGetDeviceProcAddr sharedImportResolver = nullptr;
+std::uint64_t rejectedImports = 0;
 
 VKAPI_ATTR VkResult VKAPI_CALL rejectHostPointer(VkDevice, VkExternalMemoryHandleTypeFlagBits, const void*, VkMemoryHostPointerPropertiesEXT*) {
+    ++rejectedImports;
     return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
 
@@ -344,6 +346,12 @@ std::weak_ptr<HostImport> sharedImportTests(const Device& device, Recorder& reco
     };
     const auto first = import();
     const auto firstSerial = HostImportSerial(context, address, bytes, false);
+    for (unsigned i = 0; i < 128; ++i) {
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + bytes, bytes);
+        Require(HostImportSerial(context, address, bytes, true) == firstSerial, "unrelated mapping change retired a current import");
+    }
+    for (unsigned i = 0; i < 2048; ++i) GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + bytes, bytes);
+    Require(HostImportSerial(context, address, bytes, true) == firstSerial, "expired mapping history retired current import owners");
     read(first, std::byte{0x22});
     {
         GuestBufferMemory buffers(context);
@@ -499,6 +507,238 @@ void combinedShadowTests(const Device& device, Recorder& recorder) {
     for (std::size_t i = 0; i < bytes * 3; ++i) Require(readback.Bytes()[i] == (i >= bytes && i < bytes * 2 ? std::byte{0x77} : std::byte{0x11}), "combined import lost unpublished narrow-shadow data");
     std::cout << "Combined import preserves unpublished narrow-shadow data\n";
 #endif
+}
+
+void failedImportTests(const Device& device) {
+#ifdef _WIN32
+    constexpr bool multipleRanges = false;
+#else
+    constexpr bool multipleRanges = true;
+#endif
+    auto context = device.GetContext();
+    context.hostImportAlignment = 4096;
+    context.dmaBufImport = false;
+    sharedImportResolver = context.deviceProc;
+    context.deviceProc = rejectHostImport;
+    rejectedImports = 0;
+    ClearHostImports(context.device);
+    constexpr std::size_t unit = 65536;
+    void* block = AllocateWatched(3 * unit, unit);
+    Require(block != nullptr, "failed-import test requires watched memory");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, 2 * unit, true, true);
+        mutation.Add(static_cast<std::byte*>(block) + 2 * unit, unit, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        void* block;
+        ~Cleanup() {
+            ClearHostImports(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+                mutation.Remove(static_cast<std::byte*>(block) + 2 * unit);
+            }
+            ReleaseWatched(block, 3 * unit);
+        }
+    } cleanup{context, block};
+    const auto read = [&](std::size_t offset, std::size_t bytes) {
+        Require(HostImportFor(context, address + offset, bytes) == nullptr, "a rejected host pointer became imported");
+    };
+    read(4, 64);
+    Require(rejectedImports == 1, "first import did not reach the transport");
+    for (std::size_t i = 0; i < 100; ++i) read(i * 16, 64);
+    Require(rejectedImports == 1, "unchanged allocation retried a failed import");
+    read(2 * unit - 4, 16);
+    Require(rejectedImports == (multipleRanges ? 2 : 1), "cross-allocation request reused a failure for a different span");
+    for (unsigned i = 0; i < 100; ++i) read(2 * unit - 4, 16);
+    Require(rejectedImports == (multipleRanges ? 2 : 1), "unchanged multi-mapping span retried a failed import");
+    read(2 * unit, 64);
+    Require(rejectedImports == (multipleRanges ? 3 : 2), "partial cross-allocation failure disqualified another whole allocation");
+    for (unsigned i = 0; i < 128; ++i) {
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + 3 * unit, unit);
+        read(4, 64);
+        read(2 * unit - 4, 16);
+    }
+    Require(rejectedImports == (multipleRanges ? 3 : 2), "unrelated mapping changes retried failed imports");
+    for (unsigned i = 0; i < 2048; ++i) GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + 3 * unit, unit);
+    read(4, 64);
+    read(2 * unit - 4, 16);
+    Require(rejectedImports == (multipleRanges ? 3 : 2), "expired mapping history discarded current failed import owners");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, 64);
+    read(4, 64);
+    Require(rejectedImports == (multipleRanges ? 3 : 2), "range invalidation without replacement discarded current failed owners");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Add(block, 2 * unit, true, true);
+    }
+    read(4, 64);
+    Require(rejectedImports == (multipleRanges ? 4 : 3), "replacement mapping retained the old transport decision");
+    read(2 * unit - 4, 16);
+    Require(rejectedImports == (multipleRanges ? 5 : 3), "multi-mapping span retained a failure after one mapping was replaced");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(block, unit, true, true, [] {});
+    }
+    read(4, 64);
+    read(unit + 4, 64);
+    Require(rejectedImports == (multipleRanges ? 7 : 5), "split mapping retained an allocation-wide failure");
+    ClearHostImports(context.device);
+    read(4, 64);
+    Require(rejectedImports == (multipleRanges ? 8 : 6), "clearing imports retained a transport failure");
+    std::cout << "Import failures preserve allocation boundaries, replacement identities, protection splits and device-cache clearing\n";
+}
+
+void importRangeBenchmark(const Device& device, std::size_t failures = 0) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    auto context = device.GetContext();
+    context.hostImportAlignment = 4096;
+    context.dmaBufImport = false;
+    sharedImportResolver = context.deviceProc;
+    context.deviceProc = rejectHostImport;
+    ClearHostImports(context.device);
+    constexpr std::size_t unit = 2u << 20u;
+    constexpr std::size_t count = 17;
+    const auto prefixBytes = failures * 65536;
+    void* memory = AllocateWatched(prefixBytes + unit * count, 65536);
+    Require(memory != nullptr, "import range benchmark requires watched memory");
+    {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t i = 0; i < failures; ++i) mutation.Add(static_cast<std::byte*>(memory) + i * 65536, 65536, true, true);
+        for (std::size_t i = 0; i < count; ++i) mutation.Add(static_cast<std::byte*>(memory) + prefixBytes + i * unit, unit, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        void* memory;
+        std::size_t failures;
+        std::size_t prefixBytes;
+        ~Cleanup() {
+            ClearHostImports(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                for (std::size_t i = 0; i < failures; ++i) mutation.Remove(static_cast<std::byte*>(memory) + i * 65536);
+                for (std::size_t i = 0; i < count; ++i) mutation.Remove(static_cast<std::byte*>(memory) + prefixBytes + i * unit);
+            }
+            ReleaseWatched(memory, prefixBytes + unit * count);
+        }
+    } cleanup{context, memory, failures, prefixBytes};
+    for (std::size_t i = 0; i < failures; ++i) Require(HostImportFor(context, reinterpret_cast<std::uint64_t>(memory) + i * 65536, 256) == nullptr, "forced background import succeeded");
+    for (const std::size_t bytes : {std::size_t{256}, std::size_t{16711680}, std::size_t{33423360}}) {
+        std::array<double, 9> times;
+        std::vector<std::uint64_t> addresses;
+        const bool small = failures != 0 && bytes == 256;
+        const auto queries = failures == 0 ? 1u : small ? failures : 16u;
+        const auto first = reinterpret_cast<std::uint64_t>(memory) + (small ? 4 : prefixBytes + 0xc0000);
+        for (std::size_t i = 0; i < queries; ++i) {
+            const auto address = first + i * 65536;
+            addresses.push_back(address);
+            Require(HostImportFor(context, address, bytes) == nullptr, "forced benchmark import succeeded");
+        }
+        for (unsigned pass = 0; pass <= times.size(); ++pass) {
+            const auto started = std::chrono::steady_clock::now();
+            for (unsigned i = 0; i < 65536; ++i) Require(HostImportFor(context, addresses[(i * 509u) % addresses.size()], bytes) == nullptr, "forced failed import succeeded");
+            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - started).count() / 65536;
+        }
+        std::ranges::sort(times);
+        std::cout << "Failed import range " << bytes << " bytes: median " << times[4] << " ns, p95 pass " << times.back() << " ns\n";
+    }
+}
+
+void importMappingBenchmark(const Device& device) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    auto context = device.GetContext();
+    context.hostImportAlignment = 4096;
+    context.dmaBufImport = false;
+    sharedImportResolver = context.deviceProc;
+    context.deviceProc = rejectHostImport;
+    ClearHostImports(context.device);
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t count = 1024;
+    constexpr std::size_t lookups = 64;
+    void* memory = AllocateWatched(unit * count, unit);
+    Require(memory != nullptr, "import mapping benchmark requires watched memory");
+    {
+        GuestAllocations::Mutation mutation;
+        for (std::size_t i = 0; i < count; ++i) mutation.Add(static_cast<std::byte*>(memory) + i * unit, unit, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        void* memory;
+        ~Cleanup() {
+            ClearHostImports(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                for (std::size_t i = 0; i < count; ++i) mutation.Remove(static_cast<std::byte*>(memory) + i * unit);
+            }
+            ReleaseWatched(memory, unit * count);
+        }
+    } cleanup{context, memory};
+    const auto base = reinterpret_cast<std::uintptr_t>(memory);
+    for (const auto period : {0u, 64u, 1u}) {
+        std::array<double, 9> times;
+        for (unsigned pass = 0; pass <= times.size(); ++pass) {
+            const auto started = std::chrono::steady_clock::now();
+            for (unsigned i = 0; i < 16384; ++i) {
+                if (period != 0 && i % period == 0) GuestAllocations::GuestAllocationsInvalidate_nid_postfix(base + (count - 1) * unit, unit);
+                Require(HostImportFor(context, base + (i % lookups) * unit, 256) == nullptr, "forced failed import succeeded");
+            }
+            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / 16384;
+        }
+        std::ranges::sort(times);
+        std::cout << "Import mappings " << count << ", failures " << lookups << ", change period " << period << ": median " << times[4] << " us/request, p95 pass " << times.back() << " us\n";
+    }
+}
+
+void pendingMaskBenchmark(const Device& device) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    Recorder recorder(context);
+    recorder.Activate();
+    for (const auto extent : {VkExtent2D{64, 64}, VkExtent2D{512, 512}, VkExtent2D{1920, 1080}, VkExtent2D{3840, 2160}}) {
+        GuestTextureResource resource{};
+        resource.width = extent.width;
+        resource.height = extent.height;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto bytes = DescribeSurface(resource).guestBytes;
+        void* memory = AllocateWatched(bytes, 65536);
+        Require(memory != nullptr, "pending mask benchmark requires watched memory");
+        struct Cleanup {
+            Recorder& recorder;
+            void* memory;
+            std::size_t bytes;
+            ~Cleanup() { recorder.Sync(); ReleaseWatched(memory, bytes); }
+        } cleanup{recorder, memory, static_cast<std::size_t>(bytes)};
+        std::memset(memory, 0, bytes);
+        resource.baseAddress = reinterpret_cast<std::uint64_t>(memory);
+        auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+        recorder.Sync();
+        std::array<double, 9> times;
+        for (unsigned pass = 0; pass <= times.size(); ++pass) {
+            const auto started = std::chrono::steady_clock::now();
+            for (unsigned i = 0; i < 65536; ++i) image->MarkDirty();
+            if (pass != 0) times[pass - 1] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - started).count() / 65536;
+        }
+        std::ranges::sort(times);
+        std::cout << "Pending image " << extent.width << 'x' << extent.height << ", units " << (bytes + 65535) / 65536 << ": median " << times[4] << " ns/mark, p95 pass " << times.back() << " ns\n";
+        image->Flush();
+    }
 }
 
 void readTrackingTests(const Device& device, Recorder& recorder) {
@@ -3105,6 +3345,20 @@ int main(int argc, char** argv) {
         }
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--failed-imports-only") {
+            failedImportTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-import-ranges") {
+            importRangeBenchmark(device);
+            importRangeBenchmark(device, 2048);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-import-mappings") {
+            importMappingBenchmark(device);
+            return 0;
+        }
+        failedImportTests(device);
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
