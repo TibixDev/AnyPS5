@@ -294,6 +294,10 @@ std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter
     return (filter & ~(0xffu << 20u)) | (1u << 24u) | (mipmapped ? 1u << 26u : 0u);
 }
 
+void DescriptorBindingBuilder::ValidateSamplers(const ShaderInfo& info, const ResourceSnapshot& snapshot) const {
+    static_cast<void>(ProveUnnormalized(info, snapshot));
+}
+
 void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const IrProgram& program, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
     Populate(allocation, program.Info(), program.Resources().stage, program.Resources().userDataBase, snapshot, partialThreads);
 }
