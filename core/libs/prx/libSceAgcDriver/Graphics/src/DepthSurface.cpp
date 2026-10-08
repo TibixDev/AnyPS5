@@ -110,6 +110,29 @@ public:
         if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ++stencilVersion;
     }
 
+    void CopyFrom(const DepthSurface& source, VkImageAspectFlags aspects) {
+        auto* recorder = Recorder::Active();
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        std::array<VkImageCopy, 2> copies{};
+        std::uint32_t count = 0;
+        for (const auto aspect : {VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
+            if ((aspects & aspect) == 0) continue;
+            auto& copy = copies[count++];
+            copy.srcSubresource = {static_cast<VkImageAspectFlags>(aspect), 0, 0, 1};
+            copy.dstSubresource = copy.srcSubresource;
+            copy.extent = {target.extent.width, target.extent.height, 1};
+        }
+        context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, count, copies.data());
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, access);
+        NoteWrite(aspects);
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    }
+
     std::uint64_t Version(VkImageAspectFlags aspect) const {
         return aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? stencilVersion : depthVersion;
     }
@@ -362,6 +385,31 @@ void RunDepthClearPass(const Context& context, const DepthClearPass& pass) {
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, pass.target));
     surfaces().back()->Clear(pass);
+}
+
+void RunDepthCopyPass(const Context& context, const DepthCopyPass& pass) {
+    Require(pass.aspects != 0 && (pass.aspects & ~(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) == 0, "invalid depth copy aspects");
+    Require(pass.source.format == pass.destination.format && pass.source.extent.width == pass.destination.extent.width && pass.source.extent.height == pass.destination.extent.height, "depth copy surfaces have incompatible formats or extents");
+    Require((pass.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) == 0 || (pass.source.address != 0 && pass.destination.address != 0), "depth copy has an absent depth plane");
+    Require((pass.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) == 0 || (pass.source.stencilAddress != 0 && pass.destination.stencilAddress != 0), "depth copy has an absent stencil plane");
+    std::lock_guard lock(surfacesMutex());
+    DepthSurface* source = nullptr;
+    DepthSurface* destination = nullptr;
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != context.device) continue;
+        if (sameSurface(surface->target, pass.source)) source = surface.get();
+        if (sameSurface(surface->target, pass.destination)) destination = surface.get();
+    }
+    Require(source != nullptr, "depth copy source has no resident surface");
+    if (source == destination) return;
+    Require(pass.source.address == 0 || pass.source.address != pass.destination.address, "depth copies with a shared depth plane are unsupported");
+    Require(pass.source.stencilAddress == 0 || pass.source.stencilAddress != pass.destination.stencilAddress, "depth copies with a shared stencil plane are unsupported");
+    if (destination == nullptr) {
+        Require(((pass.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || pass.destination.address == 0) && ((pass.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 || pass.destination.stencilAddress == 0), "partial depth copy destination has no resident surface");
+        surfaces().push_back(std::make_unique<DepthSurface>(context, pass.destination));
+        destination = surfaces().back().get();
+    }
+    destination->CopyFrom(*source, pass.aspects);
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {

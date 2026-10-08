@@ -2603,6 +2603,62 @@ void depthClearPassTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+void depthCopyPassTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    SampleProgram depthProgram(context, recorder);
+    SampleProgram stencilProgram(context, recorder, SAMPLE_Stencil_ARRAY_SPV, true);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        ~Release() { recorder.Sync(); ClearDepthSurfaces(context.device); }
+    } release{context, recorder};
+    for (const auto format : {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+        const bool stencil = format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        const VkImageAspectFlags both = VK_IMAGE_ASPECT_DEPTH_BIT | (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        DepthTarget source{stencil ? 0x50000u : 0x10000u, stencil ? 0x60000u : 0u, {64, 64}, format, 0.25f, 19};
+        auto destination = source;
+        destination.address += 0x20000;
+        if (stencil) destination.stencilAddress += 0x20000;
+        RunDepthClearPass(context, {source, both});
+        const auto submissions = recorder.Submissions();
+        RunDepthCopyPass(context, {source, destination, both});
+        Require(recorder.Submissions() == submissions, "depth copy submitted or waited instead of recording");
+        GuestTextureResource resource{};
+        resource.baseAddress = destination.address;
+        resource.width = 64;
+        resource.height = 64;
+        resource.mipCount = 1;
+        resource.dimension = TextureDimension::k2D;
+        resource.tileMode = TextureTileMode::kZ64KBX;
+        resource.format = stencil ? 22 : 7;
+        const std::array<std::uint32_t, 8> words{};
+        const VkComponentMapping mapping{};
+        const auto texture = DepthSurfaceTexture(context, words, resource, mapping);
+        Require(texture != nullptr, "depth copy did not create a sampleable destination");
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0), 0.25f, "copied depth contents");
+        source.clearDepth = 0.75f;
+        RunDepthClearPass(context, {source, VK_IMAGE_ASPECT_DEPTH_BIT});
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0), 0.25f, "copy destination aliases its source");
+        RunDepthCopyPass(context, {source, destination, VK_IMAGE_ASPECT_DEPTH_BIT});
+        Require(DepthSurfaceTexture(context, words, resource, mapping) == texture, "repeated depth copy replaced the destination view");
+        expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0), 0.75f, "repeated depth copy kept stale contents");
+        if (stencil) {
+            auto stencilResource = resource;
+            stencilResource.baseAddress = destination.stencilAddress;
+            stencilResource.format = 5;
+            stencilResource.dimension = TextureDimension::k2DArray;
+            const auto stencilTexture = DepthSurfaceTexture(context, words, stencilResource, mapping);
+            expectRed(stencilProgram.Red(stencilTexture->View(), stencilTexture->Layout(), 0, 0), 19, "depth-only copy changed destination stencil");
+            source.clearStencil = 47;
+            RunDepthClearPass(context, {source, VK_IMAGE_ASPECT_STENCIL_BIT});
+            RunDepthCopyPass(context, {source, destination, VK_IMAGE_ASPECT_STENCIL_BIT});
+            Require(DepthSurfaceTexture(context, words, stencilResource, mapping) == stencilTexture, "stencil copy replaced the destination view");
+            expectRed(stencilProgram.Red(stencilTexture->View(), stencilTexture->Layout(), 0, 0), 47, "stencil copy did not refresh its sampled view");
+            expectRed(depthProgram.Red(texture->View(), texture->Layout(), 0), 0.75f, "stencil-only copy changed destination depth");
+        }
+    }
+}
+
 class DepthOperations {
 public:
     explicit DepthOperations(Context& context) : context(context), resolver(context.deviceProc),
@@ -3307,6 +3363,11 @@ int main(int argc, char** argv) {
             std::cout << "Resident depth clear sampling and aspect preservation tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-copy-only") {
+            depthCopyPassTests(device, recorder);
+            std::cout << "Resident depth/stencil copy, refresh and aspect preservation tests passed\n";
+            return 0;
+        }
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
@@ -3344,6 +3405,7 @@ int main(int argc, char** argv) {
         atomicViewTests(device, recorder);
         metadataPassTests(device, recorder);
         depthClearPassTests(device, recorder);
+        depthCopyPassTests(device, recorder);
         depthArrayTests(device, recorder);
         depthArrayGuestTests(device, recorder);
         pendingKeyStoreTests(device, recorder);

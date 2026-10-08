@@ -25,6 +25,26 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     }
     rejected = Graphics::DepthMaintenanceRejection(queue);
     if (!rejected.empty()) return DrawVerdict::Rejected;
+    if (const auto pass = Graphics::DecodeDepthCopyPass(queue)) {
+        require(!drawParameters.indirect, "indirect depth copies are unsupported");
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (device == nullptr) device = std::make_shared<VulkanDevice>();
+        const std::shared_ptr<VulkanDevice> localDevice = device;
+        recordLabelsForPacket(localDevice.get(), submission.queue);
+        localDevice->DepthCopyPass(*pass);
+        return DrawVerdict::Drawn;
+    }
+    if (const auto pass = Graphics::DecodeDepthClearPass(queue)) {
+        require(!drawParameters.indirect, "indirect depth clears are unsupported");
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (device == nullptr) device = std::make_shared<VulkanDevice>();
+        const std::shared_ptr<VulkanDevice> localDevice = device;
+        recordLabelsForPacket(localDevice.get(), submission.queue);
+        localDevice->DepthClearPass(*pass);
+        return DrawVerdict::Drawn;
+    }
     static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
     traceIndirect = traceIndirectEnabled;
     if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
