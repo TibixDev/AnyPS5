@@ -385,6 +385,7 @@ target_include_directories(agc_driver_recorder_tests PRIVATE
 )
 
 target_link_libraries(agc_driver_recorder_tests PRIVATE
+        libkernel
         libSceAgcDriver
         SDL2-static
         libc

@@ -31,6 +31,7 @@ public:
         std::uint64_t lookups = 0;
         std::uint64_t hits = 0;
         std::uint64_t invalidations = 0;
+        std::uint64_t mappingInvalidations = 0;
         std::uint64_t evictions = 0;
         std::uint64_t uploadedBytes = 0;
         std::uint64_t uploads = 0;
