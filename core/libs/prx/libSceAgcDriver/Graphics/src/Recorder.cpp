@@ -2214,14 +2214,14 @@ std::pair<std::shared_ptr<Buffer>, std::size_t> Recorder::AllocateDrawUpload(std
     static const bool pooled = std::getenv("APS5_NO_DRAW_UPLOAD_POOL") == nullptr;
     if (!pooled || bytes > pageBytes) {
         auto buffer = std::make_shared<Buffer>(context, bytes, usage);
-        open->kept.push_back(buffer);
+        Keep(buffer, bytes);
         return {std::move(buffer), 0};
     }
     const auto alignment = std::max<std::size_t>(4, context.limits.minStorageBufferOffsetAlignment);
     auto offset = (open->drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (open->drawUpload == nullptr || offset > pageBytes || bytes > pageBytes - offset) {
         auto buffer = std::make_shared<Buffer>(context, pageBytes, usage);
-        open->kept.push_back(buffer);
+        Keep(buffer, pageBytes);
         open->drawUpload = std::move(buffer);
         offset = 0;
     }

@@ -1328,6 +1328,7 @@ void shaderDataSliceTests(const Device& device, Recorder& outer) {
 }
 
 void drawUploadTests(const Device& device, Recorder& recorder) {
+    recorder.Sync();
     const auto& context = device.GetContext();
     constexpr std::array<std::size_t, 7> sizes{4, 260, 4096, 65532, 12, 65540, 8188};
     constexpr std::size_t batches = 3;
@@ -1339,8 +1340,15 @@ void drawUploadTests(const Device& device, Recorder& recorder) {
     std::size_t heldOffset = 0;
     std::size_t destination = 0;
     for (std::size_t batch = 0; batch < batches; ++batch) {
+        const auto keptBefore = recorder.InFlightKeptBytes();
+        std::vector<VkBuffer> pages;
+        std::size_t pageBytes = 0;
         for (std::size_t i = 0; i < sizes.size(); ++i) {
             const auto [buffer, offset] = recorder.AllocateDrawUpload(sizes[i]);
+            if (std::find(pages.begin(), pages.end(), buffer->Handle()) == pages.end()) {
+                pages.push_back(buffer->Handle());
+                pageBytes += buffer->Bytes().size();
+            }
             Require(offset % context.limits.minStorageBufferOffsetAlignment == 0, "draw upload violates storage descriptor alignment");
             const auto value = static_cast<std::byte>(batch * sizes.size() + i + 1);
             const auto bytes = buffer->Bytes().subspan(offset, sizes[i]);
@@ -1355,8 +1363,10 @@ void drawUploadTests(const Device& device, Recorder& recorder) {
         }
         RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         recorder.Submit();
+        Require(recorder.InFlightKeptBytes() == keptBefore + pageBytes, "draw uploads must count each retained buffer once in the batch byte budget");
     }
     recorder.Sync();
+    Require(recorder.InFlightKeptBytes() == 0, "finished draw uploads remain in the batch byte budget");
     Require(std::equal(expected.begin(), expected.end(), readback.Bytes().begin()), "draw uploads were overwritten before the GPU read them");
     for (unsigned i = 0; i < 4; ++i) {
         const auto [buffer, offset] = recorder.AllocateDrawUpload(65536);
