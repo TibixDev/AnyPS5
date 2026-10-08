@@ -3096,6 +3096,7 @@ int main(int argc, char** argv) {
             {
                 Recorder recorder(device.GetContext());
                 recorder.Activate();
+                remappedImportTests(device);
                 retired = sharedImportTests(device, recorder);
                 combinedShadowTests(device, recorder);
             }
