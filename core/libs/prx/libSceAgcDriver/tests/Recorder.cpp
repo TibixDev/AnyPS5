@@ -274,9 +274,55 @@ void sharedImportTests(const Device& device, Recorder& recorder) {
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes * 3, bytes, 0, &release.physical[0]) == 0, "allocate shared import backing");
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, bytes, 0, &release.physical[1]) == 0, "allocate remap backing");
     Require(sceKernelMapDirectMemory(&release.mappings[0], bytes * 3, 3, 0, release.physical[0], bytes) == 0, "map shared import backing");
+    auto* original = static_cast<std::byte*>(release.mappings[0]);
+#ifndef _WIN32
+    {
+        using namespace AgcDriver::GuestMemory;
+        const auto address = reinterpret_cast<std::uint64_t>(original);
+        bool checkTracking = WriteWatched();
+        if (const char* request = std::getenv("APS5_WRITE_WATCH_IMPORTS"); request != nullptr && std::strcmp(request, "unwatch") == 0) checkTracking = false;
+        const auto checkWatch = [&] {
+            if (!checkTracking) return;
+            std::memset(original, 0x44, bytes * 3);
+            Require(CollectWritesUncached(address, bytes * 3) != 0, "shared backing was not watched before import");
+            const auto* imported = HostImportFor(context, address, bytes * 3);
+            Require(imported != nullptr, "import watched shared backing");
+            if (imported->unwatched) {
+                checkTracking = false;
+                return;
+            }
+            Require(!imported->unwatched, "shared import unnecessarily disabled write tracking");
+            const auto generation = CollectWritesUncached(address, bytes * 3);
+            Require(generation != 0, "shared import lost write tracking");
+            const auto read = [&] {
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                CopyBuffer(context, commands, imported->buffer, address - imported->base, combinedReadback.Handle(), 0, bytes * 3);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+                recorder.Sync();
+            };
+            read();
+            Require(std::all_of(combinedReadback.Bytes().begin(), combinedReadback.Bytes().end(), [](std::byte value) { return value == std::byte{0x44}; }), "watched shared import read wrong contents");
+            Require(CollectWritesUncached(address, bytes * 3) != 0 && UnchangedSince(address, bytes * 3, generation), "GPU read invalidated unchanged shared memory");
+            for (std::size_t offset = 0; offset < bytes * 3; offset += 4096) original[offset] = std::byte{0x66};
+            const auto written = CollectWritesUncached(address, bytes * 3);
+            Require(written > generation && !UnchangedSince(address, bytes * 3, generation), "shared import hid a CPU write");
+            for (std::size_t offset = 0; offset < bytes * 3; offset += 65536) Require(!UnchangedSince(address + offset, 65536, generation), "shared import missed a CPU-written block");
+            read();
+            for (std::size_t offset = 0; offset < bytes * 3; ++offset) Require(combinedReadback.Bytes()[offset] == (offset % 4096 == 0 ? std::byte{0x66} : std::byte{0x44}), "shared import missed a CPU write after a GPU read");
+            Require(CollectWritesUncached(address, bytes * 3) != 0 && UnchangedSince(address, bytes * 3, written), "repeated GPU read dirtied shared memory");
+        };
+        checkWatch();
+        void* middle = original + bytes;
+        Require(sceKernelMapDirectMemory(&middle, bytes, 3, 0x10, release.physical[1], bytes) == 0, "split watched shared import backing");
+        checkWatch();
+        Require(sceKernelMapDirectMemory(&middle, bytes, 3, 0x10, release.physical[0] + bytes, bytes) == 0, "restore watched shared import backing");
+        checkWatch();
+        std::cout << (checkTracking ? "Shared import write tracking checked across GPU reads, CPU writes, combined backings and remaps\n" : "Shared import write tracking disabled: tracking checks skipped\n");
+    }
+#endif
     Require(sceKernelMapDirectMemory(&release.mappings[1], bytes, 3, 0, release.physical[1], bytes) == 0, "map remap backing");
     Require(sceKernelMapDirectMemory(&release.mappings[2], bytes, 3, 0, release.physical[0] + bytes, bytes) == 0, "map nonzero backing offset");
-    auto* original = static_cast<std::byte*>(release.mappings[0]);
     std::memset(original, 0x11, bytes);
     std::memset(original + bytes, 0x22, bytes);
     std::memset(original + bytes * 2, 0x33, bytes);
