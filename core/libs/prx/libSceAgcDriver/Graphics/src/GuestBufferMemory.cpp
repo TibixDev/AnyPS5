@@ -393,7 +393,7 @@ std::shared_ptr<HostImport> importAllocation(const Context& context, HostImports
     }
 #else
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) {
-        state.failed.insert(base);
+        state.failed.emplace(key, entry.ranges);
         return nullptr;
     }
 #endif
