@@ -1190,7 +1190,7 @@ void resourceBuildBenchmark(const Device& device) {
             binding.binding = 8 + i;
             binding.count = 1;
             binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-            binding.imageSamplers = {0};
+            binding.usage = std::make_shared<const ShaderRecompiler::DescriptorBindingUsage>(ShaderRecompiler::DescriptorBindingUsage{.imageSamplers = {0}});
             const auto base = address + (i + 1) * 16384;
             binding.guestDescriptor = {static_cast<std::uint32_t>(base >> 8), static_cast<std::uint32_t>(base >> 40) | (56u << 20) | (3u << 30), 15u | (63u << 14), 0x90000fac, 0, 0, 0, 0};
             program.bindings.push_back(std::move(binding));
