@@ -231,7 +231,7 @@ void CheckCollectBoundaries() {
     Require(before != 0, "an unwatched neighbor prevented collecting a watched prefix");
     memory[0] ^= 1;
     BumpCollectEpoch();
-    Require(CollectWrites(base, 16) > before && !UnchangedSince(base, 16, before), "partial-block fallback missed a CPU write");
+    Require(CollectWrites(base, 16) > before && !UnchangedSince(base, 16, before), "partial-block collection missed a CPU write");
     GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory + 4096, 4096);
     Require(CollectWrites(base + 4096, 1) != 0, "a re-registered neighbor stayed unwatched");
 #endif

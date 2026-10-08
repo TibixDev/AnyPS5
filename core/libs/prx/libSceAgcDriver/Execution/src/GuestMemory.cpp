@@ -1140,20 +1140,17 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-    auto scanFirst = first;
-    auto scanStop = stop;
+#ifndef _WIN32
     if (useMemo && threadCollectEpoch != 0 && bytes <= WriteBlockBytes) {
         const auto begin = first & ~(WriteBlockBytes - 1);
         const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
         if (end > begin && tracker.covers(begin, end - begin)) {
-            scanFirst = begin;
-            scanStop = end;
+            first = begin;
+            stop = end;
         }
     }
-    if (walkWrites(tracker, scanFirst, scanStop, StampKind::Cpu)) {
-        first = scanFirst;
-        stop = scanStop;
-    } else if ((scanFirst == first && scanStop == stop) || !walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+#endif
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
