@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "CacheKey.hpp"
+#include "prx/libc/include/general/VabiMacros.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -26,6 +27,8 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
+
+extern "C" std::terminate_handler APS5_VABI _ZSt13set_terminatePFvvE_nid_postfix(std::terminate_handler handler);
 
 namespace {
 
@@ -1495,11 +1498,11 @@ void descriptorPoolResetFailureTest() {
     const VkDescriptorPoolSize size{binding.descriptorType, binding.descriptorCount};
     const auto allocation = cache.Allocate(layout, std::span(&size, 1));
     mock.descriptorResetResult = VK_ERROR_DEVICE_LOST;
-    const auto previous = std::set_terminate([] {
+    const auto previous = _ZSt13set_terminatePFvvE_nid_postfix([] {
         std::_Exit(mock.descriptorResetResult == VK_SUCCESS ? 0 : 1);
     });
     cache.Free(allocation);
-    std::set_terminate(previous);
+    _ZSt13set_terminatePFvvE_nid_postfix(previous);
 }
 
 void pushConstantTests() {
