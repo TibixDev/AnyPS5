@@ -2715,6 +2715,25 @@ void clearDepthAttachment(const Context& context, Recorder& recorder, const Dept
 }
 
 void depthArrayTests(const Device& device, Recorder& recorder, bool failBeforeSync = false) {
+    constexpr std::size_t reservedBytes = 12 * 1024 * 1024;
+#ifdef _WIN32
+    void* reserved = VirtualAlloc(nullptr, reservedBytes, MEM_RESERVE, PAGE_NOACCESS);
+    Require(reserved != nullptr, "cannot reserve depth array test addresses");
+#else
+    void* reserved = mmap(nullptr, reservedBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(reserved != MAP_FAILED, "cannot reserve depth array test addresses");
+#endif
+    struct Reservation {
+        void* address;
+        ~Reservation() {
+#ifdef _WIN32
+            VirtualFree(address, 0, MEM_RELEASE);
+#else
+            munmap(address, reservedBytes);
+#endif
+        }
+    } reservation{reserved};
+    const auto reservedAddress = reinterpret_cast<std::uint64_t>(reserved);
     auto context = device.GetContext();
     DepthOperations operations(context);
     TextureDetiler detiler(context);
@@ -2731,7 +2750,7 @@ void depthArrayTests(const Device& device, Recorder& recorder, bool failBeforeSy
     } release{context, recorder};
     for (const auto format : {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
         const bool stencil = format == VK_FORMAT_D32_SFLOAT_S8_UINT;
-        DepthTarget target{stencil ? 0x2000000u : 0x1000000u, stencil ? 0x3000000u : 0u, {129, 137}, format, 0.0f, 0};
+        DepthTarget target{reservedAddress + (stencil ? 0x500000u : 0x100000u), stencil ? reservedAddress + 0x900000u : 0u, {129, 137}, format, 0.0f, 0};
         const auto depthStride = DepthSliceBytes(target.extent, stencil ? 4u : 2u);
         const auto stencilStride = DepthSliceBytes(target.extent, 1);
         std::array<DepthTarget, 4> targets;
