@@ -365,7 +365,7 @@ static void TestStreamPartitions() {
             std::uint32_t offset = 0;
             for (const auto size : sizes) {
                 const auto flags = offset == 0 ? SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE
-                    : SCE_NGS2_WAVEFORM_BLOCKS_FLAG_ONLY_DATA | (offset + size == data.size() ? 0 : SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE);
+                    : SCE_NGS2_WAVEFORM_BLOCKS_FLAG_APPEND | (offset + size == data.size() ? 0 : SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE);
                 Queue(voice, data.data() + offset, size, flags, 800, skip);
                 offset += size;
             }
@@ -400,7 +400,7 @@ static void APS5_VABI Refill(const Ngs2VoiceCallbackInfo* info) {
     if (state.calls != 1) return;
     Require(info->block_size == 13 && info->block_data == Superframe);
     if (state.reset) Queue(info->voice_handle, Superframe, SuperframeBytes, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_RESET, 500, 100);
-    else Queue(info->voice_handle, Superframe + 13, SuperframeBytes - 13, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_ONLY_DATA, 0xffffffffu, 0xffffffffu);
+    else Queue(info->voice_handle, Superframe + 13, SuperframeBytes - 13, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_APPEND, 0xffffffffu, 0xffffffffu);
     if (state.pause) Event(info->voice_handle, SCE_NGS2_VOICE_EVENT_PAUSE);
 }
 
@@ -437,13 +437,48 @@ static void TestStarvationAndTruncation(const std::vector<float>& reference) {
             try { Render(system, Grain); } catch (const std::invalid_argument&) { rejected = true; }
             Require(rejected);
         } else {
-            Queue(voice, Superframe + 13, SuperframeBytes - 13, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_ONLY_DATA);
+            Queue(voice, Superframe + 13, SuperframeBytes - 13, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_APPEND);
             const auto output = Render(system, 512);
             for (std::size_t i = 0; i < output.size(); ++i) Require(output[i] == (i < 500 ? reference[100 + i] : 0.0f));
             Require(Flags(voice) == 0);
         }
         Require(sceNgs2SystemDestroy(system, nullptr) == 0);
     }
+}
+
+static void TestAppendBoundaries(const std::vector<float>& reference) {
+    for (std::uint32_t split = 1; split < SuperframeBytes; ++split) {
+        const auto system = CreateSystem();
+        const auto voice = EmptySampler(system);
+        Queue(voice, Superframe, split, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE, 500, 100);
+        for (float value : Render(system, Grain)) Require(value == 0.0f);
+        const Ngs2WaveformBlock block{split, SuperframeBytes - split, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0, 0};
+        Control(voice, SCE_NGS2_SAMPLER_VOICE_PARAM_ADD_WAVEFORM_BLOCKS,
+            Ngs2SamplerVoiceWaveformBlocksParam{{}, Superframe, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_APPEND, 1, &block});
+        const auto output = Render(system, 512);
+        for (std::size_t i = 0; i < output.size(); ++i) Require(output[i] == (i < 500 ? reference[100 + i] : 0.0f));
+        Ngs2SamplerVoiceState state{};
+        Require(sceNgs2VoiceGetState(voice, &state.voice_state, sizeof(state)) == SCE_NGS2_OK);
+        Require(state.num_decoded_samples == 500 && state.decoded_data_size == SuperframeBytes);
+        Require(state.waveform_data == Superframe + SuperframeBytes && Flags(voice) == 0);
+        Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+    }
+}
+
+static void TestAppendWithoutWaveform() {
+    const auto system = CreateSystem();
+    const auto voice = EmptySampler(system);
+    bool rejected = false;
+    try {
+        Queue(voice, Superframe, SuperframeBytes, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_APPEND, 500);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    Require(rejected);
+    Queue(voice, Superframe, SuperframeBytes, 0, 500);
+    Render(system, 512);
+    Require(Flags(voice) == 0);
+    Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
 }
 
 int main() {
@@ -458,5 +493,7 @@ int main() {
     TestStreamPartitions();
     TestRefill(reference);
     TestStarvationAndTruncation(reference);
+    TestAppendBoundaries(reference);
+    TestAppendWithoutWaveform();
     return 0;
 }
