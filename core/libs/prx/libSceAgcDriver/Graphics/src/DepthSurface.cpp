@@ -80,6 +80,21 @@ public:
     DepthSurface(const DepthSurface&) = delete;
     DepthSurface& operator=(const DepthSurface&) = delete;
 
+    void Clear(const DepthClearPass& pass) {
+        auto* recorder = Recorder::Active();
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearDepthStencilValue clear{pass.target.clearDepth, pass.target.clearStencil};
+        const VkImageSubresourceRange range{pass.aspects, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, access);
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    }
+
     std::shared_ptr<Texture> Sampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
         std::array<std::uint32_t, 12> key{};
         std::copy_n(words.begin(), std::min<std::size_t>(words.size(), 8), key.begin());
@@ -161,6 +176,20 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
+}
+
+void RunDepthClearPass(const Context& context, const DepthClearPass& pass) {
+    Require(pass.aspects != 0 && (pass.aspects & ~(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) == 0, "invalid depth clear aspects");
+    Require((pass.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) == 0 || pass.target.address != 0, "depth clear has no depth plane");
+    Require((pass.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) == 0 || pass.target.stencilAddress != 0, "stencil clear has no stencil plane");
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != context.device || !sameSurface(surface->target, pass.target)) continue;
+        surface->Clear(pass);
+        return;
+    }
+    surfaces().push_back(std::make_unique<DepthSurface>(context, pass.target));
+    surfaces().back()->Clear(pass);
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
