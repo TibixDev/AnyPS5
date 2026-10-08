@@ -2151,8 +2151,8 @@ void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
     if (pool.handle != allocation.pool || pool.liveSets == 0) std::terminate();
     if (--pool.liveSets != 0) return;
     const auto result = resetPool(context.device, pool.handle, 0);
-    pool.exhausted = result != VK_SUCCESS;
-    if (result != VK_SUCCESS) std::fprintf(stderr, "[gpu] descriptor pool reset failed (%d); pool retired\n", static_cast<int>(result));
+    if (result != VK_SUCCESS) std::terminate();
+    pool.exhausted = false;
 }
 
 DescriptorCache::Stats DescriptorCache::Counters() const {

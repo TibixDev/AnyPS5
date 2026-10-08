@@ -15,6 +15,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <initializer_list>
 #include <iostream>
 #include <map>
@@ -1482,20 +1483,23 @@ void descriptorPoolTests() {
         Require(mock.descriptorPools.at(first.pool).resets == 2 && mock.descriptorPools.at(third.pool).resets == 1 && mock.descriptorPools.at(fifth.pool).resets == 1, "descriptor pool ownership was lost after recycling");
     }
     Require(mock.live == 0 && mock.descriptorPools.empty(), "descriptor pool cache leaked Vulkan objects");
-    {
-        DescriptorCache cache(mockContext());
-        const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        const std::array<std::uint32_t, 4> key{binding.binding, binding.descriptorType, binding.descriptorCount, binding.stageFlags};
-        const auto layout = cache.Layout(key, std::span(&binding, 1));
-        const VkDescriptorPoolSize size{binding.descriptorType, binding.descriptorCount};
-        const auto first = cache.Allocate(layout, std::span(&size, 1));
-        mock.descriptorResetResult = VK_ERROR_DEVICE_LOST;
-        cache.Free(first);
-        const auto next = cache.Allocate(layout, std::span(&size, 1));
-        Require(next.pool != first.pool, "a descriptor pool was reused after reset failed");
-        cache.Free(next);
-    }
-    Require(mock.live == 0 && mock.descriptorPools.empty(), "failed descriptor pool reset leaked Vulkan objects");
+}
+
+void descriptorPoolResetFailureTest() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    DescriptorCache cache(mockContext());
+    const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    const std::array<std::uint32_t, 4> key{binding.binding, binding.descriptorType, binding.descriptorCount, binding.stageFlags};
+    const auto layout = cache.Layout(key, std::span(&binding, 1));
+    const VkDescriptorPoolSize size{binding.descriptorType, binding.descriptorCount};
+    const auto allocation = cache.Allocate(layout, std::span(&size, 1));
+    mock.descriptorResetResult = VK_ERROR_DEVICE_LOST;
+    const auto previous = std::set_terminate([] {
+        std::_Exit(mock.descriptorResetResult == VK_SUCCESS ? 0 : 1);
+    });
+    cache.Free(allocation);
+    std::set_terminate(previous);
 }
 
 void pushConstantTests() {
@@ -2531,13 +2535,18 @@ void vertexCopyTests() {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
 #else
     setenv("APS5_PIN_WAIT_MS", "200", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-reset-failure") {
+            descriptorPoolResetFailureTest();
+            std::cerr << "descriptor pool reset failure did not terminate\n";
+            return 1;
+        }
         {
             const AgcDriver::Graphics::Context context{};
             const AgcDriver::Graphics::State state{};
