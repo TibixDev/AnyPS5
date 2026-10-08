@@ -2206,6 +2206,29 @@ void Recorder::BoundKeptBytes() {
     }
 }
 
+std::pair<std::shared_ptr<Buffer>, std::size_t> Recorder::AllocateDrawUpload(std::size_t bytes) {
+    constexpr std::size_t pageBytes = 65536;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    Require(bytes != 0 && bytes <= context.limits.maxStorageBufferRange, "invalid draw upload size");
+    ensureOpen();
+    static const bool pooled = std::getenv("APS5_NO_DRAW_UPLOAD_POOL") == nullptr;
+    if (!pooled || bytes > pageBytes) {
+        auto buffer = std::make_shared<Buffer>(context, bytes, usage);
+        open->kept.push_back(buffer);
+        return {std::move(buffer), 0};
+    }
+    const auto alignment = static_cast<std::size_t>(context.limits.minStorageBufferOffsetAlignment);
+    auto offset = (open->drawUploadUsed + alignment - 1) & ~(alignment - 1);
+    if (open->drawUpload == nullptr || offset > pageBytes || bytes > pageBytes - offset) {
+        auto buffer = std::make_shared<Buffer>(context, pageBytes, usage);
+        open->kept.push_back(buffer);
+        open->drawUpload = std::move(buffer);
+        offset = 0;
+    }
+    open->drawUploadUsed = offset + bytes;
+    return {open->drawUpload, offset};
+}
+
 namespace {
 std::size_t SnapshotPool(Recorder::SnapshotUse use) {
     return use == Recorder::SnapshotUse::Storage ? 0 : 1;
@@ -2219,7 +2242,7 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived) {
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::size_t* offset) {
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
@@ -2229,10 +2252,11 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
     if (derived != nullptr) *derived = found->second.derived;
+    if (offset != nullptr) *offset = found->second.offset;
     return found->second.buffer;
 }
 
-void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::size_t offset) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
     const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
@@ -2247,7 +2271,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, offset});
     } catch (...) {
         pool.recency.pop_back();
         throw;

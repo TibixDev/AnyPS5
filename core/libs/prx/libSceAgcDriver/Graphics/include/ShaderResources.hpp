@@ -110,6 +110,9 @@ public:
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            std::size_t offset = 0;
+            std::size_t size = 0;
+            std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(offset, size); }
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
@@ -401,6 +404,7 @@ private:
     // The cache pool the set was allocated from, freed back to it on release.
     VkDescriptorPool cachePool = VK_NULL_HANDLE;
     std::vector<Allocation> allocations;
+    std::vector<VkDescriptorPoolSize> descriptorSizes;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
